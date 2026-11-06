@@ -12,9 +12,13 @@ Browser-based AR: point your phone at any QR code and a 3D model appears standin
 - Size slider and front/back camera switch
 
 ## How it works
-Each frame is scanned with [jsQR](https://github.com/cozmo/jsQR), which returns the QR's four corners.
-A homography from those corners gives the camera pose of the code, and [three.js](https://threejs.org)
-renders the model over the live video with a matching camera.
+1. **Find** – [jsQR](https://github.com/cozmo/jsQR) decodes the QR code in a Web Worker and returns its four corners.
+2. **Track** – `tracker.js` follows ~80 feature points inside the code from frame to frame with pyramidal
+   Lucas–Kanade optical flow and fits a homography with RANSAC (≈5–10 ms per frame), so the model
+   updates on every camera frame instead of waiting for a slow decode.
+3. **Correct** – jsQR re-checks the code a few times per second to read its text and fix any drift.
+4. **Render** – the homography gives the camera pose of the code; [three.js](https://threejs.org) draws the
+   model over the exact camera frame that was tracked, so model and video never drift apart.
 
 ## Notes
 - Camera access requires HTTPS (GitHub Pages is fine) or `localhost`.

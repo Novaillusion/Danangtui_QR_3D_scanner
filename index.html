@@ -87,6 +87,8 @@
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
+import { QRTracker, toGray, buildPyramid } from './tracker.js';
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
@@ -95,8 +97,8 @@ const statusText = $('statusText'), dot = $('dot');
 
 // ---------- Settings ----------
 const ASSUMED_FOV_DEG = 65;   // field of view along the longer image side (typical phone/webcam)
-const DETECT_MAX_SIDE = 640;  // downscale frames for faster QR detection
-const LOST_AFTER_MS = 600;    // keep the model briefly when tracking drops for a few frames
+const TRACK_MAX_SIDE = 640;   // frames are downscaled to this for tracking and QR decoding
+const LOST_AFTER_MS = 400;    // keep the model briefly when tracking drops for a few frames
 
 // ---------- three.js ----------
 const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, alpha: true, antialias: true });
@@ -191,7 +193,7 @@ async function loadModel(source) {
     let gltf = modelCache.get(source);
     if (!gltf) { gltf = await loader.loadAsync(source); modelCache.set(source, gltf); }
     if (currentSource !== source) return; // user switched meanwhile
-    const obj = gltf.scene.clone(true);
+    const obj = cloneSkinned(gltf.scene);   // keeps skeletons working for animated models
     setModel(fitModel(obj), gltf.animations);
   } catch (e) {
     console.error(e);
@@ -232,6 +234,10 @@ function layout() {
   Object.assign(stage.style, { width: w + 'px', height: h + 'px', left: (W - w) / 2 + 'px', top: (H - h) / 2 + 'px' });
   renderer.setSize(w, h, false);
   const bgc = $('bg'); if (bgc.width !== vw || bgc.height !== vh) { bgc.width = vw; bgc.height = vh; }
+  ts = Math.min(1, TRACK_MAX_SIDE / Math.max(vw, vh));
+  tw = Math.round(vw * ts); th = Math.round(vh * ts);
+  trackCanvas.width = tw; trackCanvas.height = th;
+  tracker.reset(); history.clear(); recent.clear();
   focal = (Math.max(vw, vh) / 2) / Math.tan(THREE.MathUtils.degToRad(ASSUMED_FOV_DEG) / 2);
   camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan((vh / 2) / focal));
   camera.aspect = vw / vh;
@@ -350,9 +356,9 @@ function decode(buf, w, h) {
   });
 }
 
-// One Euro filter: strong smoothing when the code is still (no jitter), almost none when it moves (no lag).
+// One Euro filter: smooths sub-pixel jitter when still, adds almost no lag when moving.
 class OneEuro {
-  constructor(minCutoff = 1.2, beta = 0.02, dCutoff = 1.0) { Object.assign(this, { minCutoff, beta, dCutoff }); this.x = null; }
+  constructor(minCutoff = 3.0, beta = 0.05, dCutoff = 1.0) { Object.assign(this, { minCutoff, beta, dCutoff }); this.x = null; }
   reset() { this.x = null; }
   filter(x, t) {
     if (this.x === null) { this.x = x; this.dx = 0; this.t = t; return x; }
@@ -366,69 +372,109 @@ class OneEuro {
 const filters = Array.from({ length: 8 }, () => new OneEuro());
 const filterCorners = (pts, tSec) => pts.map((p, i) => [filters[2*i].filter(p[0], tSec), filters[2*i+1].filter(p[1], tSec)]);
 
-const detCanvas = document.createElement('canvas');
-const detCtx = detCanvas.getContext('2d', { willReadFrequently: true });
+// Pipeline per camera frame:
+//   1. draw the frame on screen and into a small tracking canvas (same frame -> model and video stay in sync)
+//   2. the optical-flow tracker moves the QR corners to this frame (~5-10 ms)
+//   3. in the background, jsQR decodes occasionally: to find the code when not tracking,
+//      to read its text, and to correct any drift.
+const trackCanvas = document.createElement('canvas');
+const trackCtx = trackCanvas.getContext('2d', { willReadFrequently: true });
 const bg = $('bg'), bgCtx = bg.getContext('2d');
+const tracker = new QRTracker();
+let tw = 0, th = 0, ts = 1;             // tracking image size and scale (tracking px = video px * ts)
+let lastVideoTime = -1, frameSeq = 0, latest = null;   // latest = { seq, pyr }
+const history = new Map();              // seq -> tracked corners, for drift checks
+const recent = new Map();               // seq -> pyramid of the last few frames, to catch up after a decode
+let decodeBusy = false, lastDecodeAt = 0;
 let tracking = false, lastSeen = 0, lastText = '';
-let roi = null, roiMisses = 0;          // region of interest around the last known code position
-let busy = false, lastVideoTime = -1;
 
 function setStatus(text, on) {
   statusText.textContent = text;
   dot.classList.toggle('on', !!on);
 }
 
-function showFrame(bitmap) {
-  bgCtx.drawImage(bitmap, 0, 0, bg.width, bg.height);
-  bitmap.close?.();
+function applyPose(cornersTrack, now) {
+  const pts = cornersTrack.map(([x, y]) => [x / ts, y / ts]);
+  const M = poseFromCorners(filterCorners(pts, now / 1000));
+  if (!M) return;
+  anchor.matrix.copy(M);
+  anchor.matrixWorldNeedsUpdate = true;
+  anchor.visible = true;
+  tracking = true;
+  lastSeen = now;
 }
 
-async function detectStep() {
-  if (busy || !vw || video.readyState < 2) return;
-  if (video.currentTime === lastVideoTime) return;   // no new camera frame yet
-  lastVideoTime = video.currentTime;
-  busy = true;
-  let frame;
-  try { frame = await createImageBitmap(video); } catch (e) { busy = false; return; }
-  const t = performance.now();
-
-  // Search only around the last position while tracking → far fewer pixels → much faster decode.
-  let rx = 0, ry = 0, rw = vw, rh = vh, maxSide = DETECT_MAX_SIDE;
-  if (roi) {
-    const pad = Math.max(roi.w, roi.h) * (0.6 + 0.4 * roiMisses);
-    rx = Math.max(0, Math.floor(roi.x - pad)); ry = Math.max(0, Math.floor(roi.y - pad));
-    rw = Math.min(vw, Math.ceil(roi.x + roi.w + pad)) - rx; rh = Math.min(vh, Math.ceil(roi.y + roi.h + pad)) - ry;
-    maxSide = 480;
+// Start tracking from a decoded frame, then catch up to the newest frame.
+function initFrom(pyr, seq, corners, now) {
+  tracker.reset();
+  if (!tracker.init(pyr, corners)) return;
+  filters.forEach(f => f.reset());
+  history.set(seq, corners);
+  let c = corners;
+  // Step through every frame captured since the decoded one (small motion per step → reliable).
+  for (let s = seq + 1; latest && s <= latest.seq && c; s++) {
+    const p = recent.get(s);
+    if (!p) continue;
+    c = tracker.update(p);
+    if (c) history.set(s, c);
   }
-  const s = Math.min(1, maxSide / Math.max(rw, rh));
-  const w = Math.max(8, Math.round(rw * s)), h = Math.max(8, Math.round(rh * s));
-  if (detCanvas.width !== w || detCanvas.height !== h) { detCanvas.width = w; detCanvas.height = h; }
-  detCtx.drawImage(frame, rx, ry, rw, rh, 0, 0, w, h);
-  const res = await decode(detCtx.getImageData(0, 0, w, h).data.buffer, w, h);
+  if (c) applyPose(c, now);
+}
 
-  let M = null;
-  if (res.found) {
-    const pts = res.pts.map(([x, y]) => [rx + x / s, ry + y / s]);
-    M = poseFromCorners(filterCorners(pts, t / 1000));
-    if (M) {
-      const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
-      roi = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
-      roiMisses = 0;
-      anchor.matrix.copy(M);
-      anchor.matrixWorldNeedsUpdate = true;
-      anchor.visible = true;
-      tracking = true;
-      lastSeen = t;
-      onCodeText(res.text);
-      setStatus('Tracking: ' + (res.text.length > 40 ? res.text.slice(0, 40) + '…' : res.text), true);
+function startDecode(img, pyr, seq, now) {
+  // Crop around the tracked code while tracking (fast); scan the whole frame otherwise.
+  let rx = 0, ry = 0, rw = tw, rh = th;
+  const cur = history.get(seq);
+  if (tracker.active && cur) {
+    const xs = cur.map(p => p[0]), ys = cur.map(p => p[1]);
+    const size = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    const pad = size * 0.5;
+    rx = Math.max(0, Math.floor(Math.min(...xs) - pad)); ry = Math.max(0, Math.floor(Math.min(...ys) - pad));
+    rw = Math.min(tw, Math.ceil(Math.max(...xs) + pad)) - rx; rh = Math.min(th, Math.ceil(Math.max(...ys) + pad)) - ry;
+    if (rw < 16 || rh < 16) { rx = 0; ry = 0; rw = tw; rh = th; }
+  }
+  const crop = new Uint8ClampedArray(rw * rh * 4);
+  for (let y = 0; y < rh; y++) crop.set(img.data.subarray(((ry + y) * tw + rx) * 4, ((ry + y) * tw + rx + rw) * 4), y * rw * 4);
+  decodeBusy = true;
+  lastDecodeAt = now;
+  decode(crop.buffer, rw, rh).then((res) => {
+    decodeBusy = false;
+    if (!res.found) return;
+    const t = performance.now();
+    const corners = res.pts.map(([x, y]) => [rx + x, ry + y]);
+    const textChanged = res.text !== lastText;
+    onCodeText(res.text);
+    setStatus('Tracking: ' + (res.text.length > 40 ? res.text.slice(0, 40) + '…' : res.text), true);
+    if (!tracker.active || textChanged) { initFrom(pyr, seq, corners, t); return; }
+    // Drift check: compare the tracker's corners on that same frame with the decoded ones.
+    const tc = history.get(seq);
+    if (tc) {
+      const size = Math.hypot(corners[0][0] - corners[2][0], corners[0][1] - corners[2][1]);
+      const err = corners.reduce((s, p, i) => s + Math.hypot(p[0] - tc[i][0], p[1] - tc[i][1]), 0) / 4;
+      if (err > 0.04 * size) initFrom(pyr, seq, corners, t);
     }
-  }
-  if (!M && roi && ++roiMisses > 3) { roi = null; roiMisses = 0; }
+  });
+}
 
-  // While tracking, show exactly the camera frame the pose was measured on,
-  // so the model and the background move together (no "swimming").
-  if (tracking) showFrame(frame); else frame.close?.();
-  busy = false;
+function processFrame(now) {
+  if (!vw || !tw || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const seq = ++frameSeq;
+
+  bgCtx.drawImage(video, 0, 0, bg.width, bg.height);
+  trackCtx.drawImage(video, 0, 0, tw, th);
+  const img = trackCtx.getImageData(0, 0, tw, th);
+  const pyr = buildPyramid(toGray(img.data, tw, th), tw, th, 5);
+  latest = { seq, pyr };
+  recent.set(seq, pyr); recent.delete(seq - 15);
+
+  if (tracker.active) {
+    const c = tracker.update(pyr);
+    if (c) { history.set(seq, c); applyPose(c, now); }
+  }
+  history.delete(seq - 90);
+
+  if (!decodeBusy && (!tracker.active || now - lastDecodeAt > 400)) startDecode(img, pyr, seq, now);
 }
 
 function onCodeText(text) {
@@ -447,17 +493,14 @@ function frame() {
   const dt = clock.getDelta();
   const now = performance.now();
 
-  detectStep();
+  processFrame(now);
 
-  if (tracking && now - lastSeen > LOST_AFTER_MS) {
+  if (tracking && !tracker.active && now - lastSeen > LOST_AFTER_MS) {
     tracking = false;
     anchor.visible = false;
-    roi = null;
     filters.forEach(f => f.reset());
     setStatus('Looking for a QR code…', false);
   }
-  // Not tracking: show the live camera directly for the lowest latency.
-  if (!tracking && vw && video.readyState >= 2) bgCtx.drawImage(video, 0, 0, bg.width, bg.height);
 
   modelHolder.scale.setScalar(userScale);
   if (spinTarget) { spinTarget.rotation.y += dt * 1.2; spinTarget.position.y = 0.6 + Math.sin(now / 600) * 0.04; }
