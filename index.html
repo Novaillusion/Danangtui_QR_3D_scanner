@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>QR AR – 3D model on a QR code</title>
+<style>
+  :root { --accent: #4f8cff; --bg: #0b0d12; --fg: #f3f5f9; --muted: #9aa3b2; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+  #stage { position: absolute; overflow: hidden; }
+  #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #stage video { object-fit: fill; }
+
+  /* Start screen */
+  #intro { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 30% 20%, #1b2340, var(--bg) 70%); z-index: 20; padding: 24px; }
+  #intro .card { max-width: 420px; text-align: center; }
+  #intro h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.02em; }
+  #intro p { color: var(--muted); line-height: 1.5; margin: 0 0 24px; }
+  button, select, label.btn { font: inherit; color: var(--fg); background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.18); border-radius: 12px; padding: 10px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); font-weight: 600; padding: 14px 28px; font-size: 17px; }
+  #error { color: #ff8a8a; margin-top: 16px; min-height: 1.4em; }
+
+  /* HUD */
+  #hud { position: fixed; left: 0; right: 0; top: 0; padding: 12px; padding-top: max(12px, env(safe-area-inset-top));
+    display: flex; justify-content: center; pointer-events: none; z-index: 10; }
+  #status { background: rgba(0,0,0,0.55); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    padding: 8px 14px; border-radius: 999px; font-size: 14px; display: flex; align-items: center; gap: 8px;
+    max-width: 92vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #f5b942; flex: none; }
+  #dot.on { background: #3ddc84; box-shadow: 0 0 8px #3ddc84; }
+
+  #controls { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    padding: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom));
+    display: flex; flex-wrap: wrap; gap: 8px; justify-content: center;
+    background: linear-gradient(transparent, rgba(0,0,0,0.6)); }
+  #controls select, #controls button, #controls label.btn { background: rgba(0,0,0,0.55);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); font-size: 14px; }
+  #controls .slider { display: flex; align-items: center; gap: 6px; background: rgba(0,0,0,0.55);
+    border-radius: 12px; padding: 6px 12px; font-size: 14px; border: 1px solid rgba(255,255,255,0.18); }
+  input[type=file] { display: none; }
+  .hidden { display: none !important; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="gl"></canvas>
+</div>
+
+<div id="intro">
+  <div class="card">
+    <h1>QR → 3D</h1>
+    <p>Point your camera at any QR code and a 3D model will appear standing on top of it.
+       Works best with a printed code at least 5&nbsp;cm wide, in good light.</p>
+    <button id="start" class="primary">Start camera</button>
+    <div id="error"></div>
+  </div>
+</div>
+
+<div id="hud" class="hidden"><div id="status"><span id="dot"></span><span id="statusText">Looking for a QR code…</span></div></div>
+
+<div id="controls" class="hidden">
+  <select id="modelSelect" title="Model">
+    <option value="builtin">Model: Crystal (built-in)</option>
+    <option value="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Duck/glTF-Binary/Duck.glb">Model: Duck</option>
+    <option value="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb">Model: Fox (animated)</option>
+    <option value="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb">Model: Helmet</option>
+  </select>
+  <label class="btn" for="file">Load .glb…</label>
+  <input id="file" type="file" accept=".glb,.gltf,model/gltf-binary" />
+  <div class="slider">Size <input id="scale" type="range" min="0.3" max="3" step="0.05" value="1" /></div>
+  <button id="flip" title="Switch camera">⟲ Camera</button>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const video = $('video'), stage = $('stage'), glCanvas = $('gl');
+const statusText = $('statusText'), dot = $('dot');
+
+// ---------- Settings ----------
+const ASSUMED_FOV_DEG = 65;   // field of view along the longer image side (typical phone/webcam)
+const DETECT_MAX_SIDE = 640;  // downscale frames for faster QR detection
+const LOST_AFTER_MS = 600;    // keep the model briefly when tracking drops for a few frames
+
+// ---------- three.js ----------
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, alpha: true, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000); // stays at origin looking down -Z
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(1, 3, 2);
+scene.add(sun);
+
+// "anchor" follows the QR code. Local frame: x = right along the code, y = up out of the code,
+// z = toward the bottom edge of the code. 1 unit = width of the QR code.
+const anchor = new THREE.Group();
+anchor.matrixAutoUpdate = false;
+anchor.visible = false;
+scene.add(anchor);
+
+// Soft contact shadow under the model
+const shadowTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  grd.addColorStop(0, 'rgba(0,0,0,0.55)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+  return new THREE.CanvasTexture(c);
+})();
+const shadow = new THREE.Mesh(new THREE.PlaneGeometry(1.3, 1.3),
+  new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false }));
+shadow.rotation.x = -Math.PI / 2;
+shadow.position.y = 0.002;
+anchor.add(shadow);
+
+const modelHolder = new THREE.Group();
+anchor.add(modelHolder);
+
+let mixer = null;
+let spinTarget = null;   // built-in model spins gently
+
+function builtinModel() {
+  const g = new THREE.Group();
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.46, 0.08, 48),
+    new THREE.MeshStandardMaterial({ color: 0x20263a, metalness: 0.4, roughness: 0.4 }));
+  base.position.y = 0.04; g.add(base);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.42, 0.015, 12, 64),
+    new THREE.MeshStandardMaterial({ color: 0x4f8cff, emissive: 0x2a5cff, emissiveIntensity: 1.2 }));
+  ring.rotation.x = Math.PI / 2; ring.position.y = 0.085; g.add(ring);
+  const gem = new THREE.Mesh(new THREE.OctahedronGeometry(0.28, 0),
+    new THREE.MeshStandardMaterial({ color: 0x8fd3ff, metalness: 0.1, roughness: 0.15, flatShading: true,
+      emissive: 0x1a3f7a, emissiveIntensity: 0.6 }));
+  gem.scale.set(1, 1.5, 1); gem.position.y = 0.6; g.add(gem);
+  spinTarget = gem;
+  return g;
+}
+
+// Normalise any loaded model: fit inside ~0.9 of the QR width and sit on the code's surface.
+function fitModel(obj) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const s = 0.9 / Math.max(size.x, size.z, size.y * 0.8, 1e-6);
+  obj.scale.multiplyScalar(s);
+  const box2 = new THREE.Box3().setFromObject(obj);
+  const c = box2.getCenter(new THREE.Vector3());
+  obj.position.x -= c.x; obj.position.z -= c.z; obj.position.y -= box2.min.y;
+  return obj;
+}
+
+function setModel(obj, animations = []) {
+  modelHolder.clear();
+  mixer = null; spinTarget = null;
+  modelHolder.add(obj);
+  if (animations.length) {
+    mixer = new THREE.AnimationMixer(obj);
+    mixer.clipAction(animations[0]).play();
+  }
+}
+
+const loader = new GLTFLoader();
+const modelCache = new Map();
+let currentSource = null;
+
+async function loadModel(source) {
+  if (source === currentSource) return;
+  currentSource = source;
+  if (source === 'builtin') { setModel(builtinModel()); spinTarget = modelHolder.children[0].children[2]; return; }
+  setStatus('Loading model…', anchor.visible);
+  try {
+    let gltf = modelCache.get(source);
+    if (!gltf) { gltf = await loader.loadAsync(source); modelCache.set(source, gltf); }
+    if (currentSource !== source) return; // user switched meanwhile
+    const obj = gltf.scene.clone(true);
+    setModel(fitModel(obj), gltf.animations);
+  } catch (e) {
+    console.error(e);
+    setStatus('Could not load that model – using the built-in one', anchor.visible);
+    currentSource = null;
+    loadModel('builtin');
+  }
+}
+loadModel('builtin');
+
+// ---------- Camera ----------
+let facingMode = 'environment';
+let stream = null;
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } }
+  });
+  video.srcObject = stream;
+  await video.play();
+  await new Promise(r => video.videoWidth ? r() : video.addEventListener('loadedmetadata', r, { once: true }));
+  // front camera is mirrored for a natural selfie view
+  stage.style.transform = facingMode === 'user' ? 'scaleX(-1)' : '';
+  layout();
+}
+
+// Make the stage the same aspect as the video, scaled to cover the screen. Video and 3D canvas share it,
+// so video pixels map 1:1 onto the 3D camera's image plane.
+let vw = 0, vh = 0, focal = 1;
+function layout() {
+  vw = video.videoWidth; vh = video.videoHeight;
+  if (!vw || !vh) return;
+  const W = innerWidth, H = innerHeight;
+  const s = Math.max(W / vw, H / vh);
+  const w = vw * s, h = vh * s;
+  Object.assign(stage.style, { width: w + 'px', height: h + 'px', left: (W - w) / 2 + 'px', top: (H - h) / 2 + 'px' });
+  renderer.setSize(w, h, false);
+  focal = (Math.max(vw, vh) / 2) / Math.tan(THREE.MathUtils.degToRad(ASSUMED_FOV_DEG) / 2);
+  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan((vh / 2) / focal));
+  camera.aspect = vw / vh;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', layout);
+
+// ---------- Geometry: homography + pose ----------
+// Solve A x = b (n×n) with partial pivoting.
+function solve(A, b) {
+  const n = b.length;
+  for (let i = 0; i < n; i++) {
+    let p = i;
+    for (let r = i + 1; r < n; r++) if (Math.abs(A[r][i]) > Math.abs(A[p][i])) p = r;
+    [A[i], A[p]] = [A[p], A[i]]; [b[i], b[p]] = [b[p], b[i]];
+    if (Math.abs(A[i][i]) < 1e-12) return null;
+    for (let r = i + 1; r < n; r++) {
+      const f = A[r][i] / A[i][i];
+      for (let c = i; c < n; c++) A[r][c] -= f * A[i][c];
+      b[r] -= f * b[i];
+    }
+  }
+  const x = new Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = b[i];
+    for (let c = i + 1; c < n; c++) s -= A[i][c] * x[c];
+    x[i] = s / A[i][i];
+  }
+  return x;
+}
+
+// Homography from 4 plane points (X,Y) to 4 image points (u,v).
+function homography(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [X, Y] = src[i], [u, v] = dst[i];
+    A.push([X, Y, 1, 0, 0, 0, -u * X, -u * Y]); b.push(u);
+    A.push([0, 0, 0, X, Y, 1, -v * X, -v * Y]); b.push(v);
+  }
+  const h = solve(A, b);
+  return h && [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
+}
+
+const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const dot3 = (a, b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const norm = (a) => Math.hypot(a[0], a[1], a[2]);
+const scale3 = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+const normalize = (a) => scale3(a, 1 / norm(a));
+
+// QR corners in its own plane (unit square, x right, y down — same handedness as the image).
+const QR_SQUARE = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
+
+// Camera pose of the QR plane from the 4 image corners (TL, TR, BR, BL) in video pixels.
+// Returns a THREE.Matrix4 (QR anchor frame -> three.js camera frame) or null.
+function poseFromCorners(corners) {
+  const H = homography(QR_SQUARE, corners);
+  if (!H) return null;
+  const cx = vw / 2, cy = vh / 2;
+  const col = (j) => [(H[0][j] - cx * H[2][j]) / focal, (H[1][j] - cy * H[2][j]) / focal, H[2][j]];
+  const m1 = col(0), m2 = col(1), m3 = col(2);
+  let lambda = 2 / (norm(m1) + norm(m2));
+  if (m3[2] * lambda < 0) lambda = -lambda;           // code must be in front of the camera
+  let r1 = scale3(m1, lambda), r2 = scale3(m2, lambda);
+  const t = scale3(m3, lambda);
+  // Re-orthonormalise (symmetric, so neither axis is favoured)
+  const a = normalize([r1[0]+r2[0], r1[1]+r2[1], r1[2]+r2[2]]);
+  const c = normalize(cross(r1, r2));
+  const d = normalize(cross(a, c));
+  const k = Math.SQRT1_2;
+  r1 = [(a[0]+d[0])*k, (a[1]+d[1])*k, (a[2]+d[2])*k];
+  r2 = [(a[0]-d[0])*k, (a[1]-d[1])*k, (a[2]-d[2])*k];
+  const r3 = cross(r1, r2);                            // points into the paper (away from camera)
+
+  // OpenCV camera (x right, y down, z forward) -> three.js camera (x right, y up, z back): diag(1,-1,-1).
+  // Anchor local axes: x -> r1, y (up out of code) -> -r3, z -> r2.
+  const M = new THREE.Matrix4();
+  M.set(
+     r1[0], -r3[0],  r2[0],  t[0],
+    -r1[1],  r3[1], -r2[1], -t[1],
+    -r1[2],  r3[2], -r2[2], -t[2],
+     0,      0,      0,      1
+  );
+  return M;
+}
+
+// ---------- Detection loop ----------
+const detCanvas = document.createElement('canvas');
+const detCtx = detCanvas.getContext('2d', { willReadFrequently: true });
+let smoothed = null, lastSeen = 0, lastText = '';
+
+function setStatus(text, on) {
+  statusText.textContent = text;
+  dot.classList.toggle('on', !!on);
+}
+
+function detect() {
+  if (!vw) return null;
+  const s = Math.min(1, DETECT_MAX_SIDE / Math.max(vw, vh));
+  const w = Math.round(vw * s), h = Math.round(vh * s);
+  if (detCanvas.width !== w) { detCanvas.width = w; detCanvas.height = h; }
+  detCtx.drawImage(video, 0, 0, w, h);
+  const img = detCtx.getImageData(0, 0, w, h);
+  const code = window.jsQR(img.data, w, h, { inversionAttempts: 'dontInvert' });
+  if (!code) return null;
+  const L = code.location;
+  const pts = [L.topLeftCorner, L.topRightCorner, L.bottomRightCorner, L.bottomLeftCorner]
+    .map(p => [p.x / s, p.y / s]);
+  return { text: code.data, pts };
+}
+
+function onCodeText(text) {
+  if (text === lastText) return;
+  lastText = text;
+  // If the QR code itself points at a .glb/.gltf file, show that model.
+  if (/^https?:\/\/\S+\.(glb|gltf)(\?\S*)?$/i.test(text.trim())) loadModel(text.trim());
+  else loadModel($('modelSelect').value);
+}
+
+const clock = new THREE.Clock();
+let userScale = 1;
+
+function frame() {
+  requestAnimationFrame(frame);
+  const dt = clock.getDelta();
+  const now = performance.now();
+
+  if (video.readyState >= 2) {
+    const found = detect();
+    if (found) {
+      // Smooth corners: follow fast motion, damp jitter when still
+      if (!smoothed) smoothed = found.pts.map(p => p.slice());
+      else {
+        const move = Math.max(...found.pts.map((p, i) => Math.hypot(p[0]-smoothed[i][0], p[1]-smoothed[i][1])));
+        const alpha = Math.min(1, 0.35 + move / 40);
+        smoothed = smoothed.map((p, i) => [p[0] + (found.pts[i][0]-p[0]) * alpha, p[1] + (found.pts[i][1]-p[1]) * alpha]);
+      }
+      const M = poseFromCorners(smoothed);
+      if (M) {
+        anchor.matrix.copy(M);
+        anchor.matrixWorldNeedsUpdate = true;
+        anchor.visible = true;
+        lastSeen = now;
+        onCodeText(found.text);
+        setStatus('Tracking: ' + (found.text.length > 40 ? found.text.slice(0, 40) + '…' : found.text), true);
+      }
+    } else if (anchor.visible && now - lastSeen > LOST_AFTER_MS) {
+      anchor.visible = false;
+      smoothed = null;
+      setStatus('Looking for a QR code…', false);
+    }
+  }
+
+  modelHolder.scale.setScalar(userScale);
+  if (spinTarget) { spinTarget.rotation.y += dt * 1.2; spinTarget.position.y = 0.6 + Math.sin(now / 600) * 0.04; }
+  if (mixer) mixer.update(dt);
+  renderer.render(scene, camera);
+}
+
+// ---------- UI ----------
+$('start').addEventListener('click', async () => {
+  $('error').textContent = '';
+  if (!navigator.mediaDevices?.getUserMedia) {
+    $('error').textContent = 'Camera not available. Open this page over HTTPS (or localhost) in a modern browser.';
+    return;
+  }
+  if (!window.jsQR) { $('error').textContent = 'QR library failed to load – check your internet connection.'; return; }
+  try {
+    await startCamera();
+    $('intro').classList.add('hidden');
+    $('hud').classList.remove('hidden');
+    $('controls').classList.remove('hidden');
+    requestAnimationFrame(frame);
+  } catch (e) {
+    console.error(e);
+    $('error').textContent = e.name === 'NotAllowedError'
+      ? 'Camera permission was denied. Allow camera access in your browser settings and try again.'
+      : 'Could not start the camera: ' + e.message;
+  }
+});
+
+$('modelSelect').addEventListener('change', (e) => { lastText = ''; currentSource = null; loadModel(e.target.value); });
+
+$('file').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  const opt = document.createElement('option');
+  opt.value = url; opt.textContent = 'Model: ' + f.name;
+  $('modelSelect').appendChild(opt);
+  $('modelSelect').value = url;
+  currentSource = null; loadModel(url);
+});
+
+$('scale').addEventListener('input', (e) => { userScale = parseFloat(e.target.value); });
+
+$('flip').addEventListener('click', async () => {
+  facingMode = facingMode === 'environment' ? 'user' : 'environment';
+  try { await startCamera(); } catch (e) { setStatus('Could not switch camera', false); }
+});
+</script>
+</body>
+</html>
