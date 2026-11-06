@@ -62,7 +62,7 @@
 <div id="intro">
   <div class="card">
     <h1>QR → 3D</h1>
-    <p>Point your camera at any QR code and a 3D model will appear standing on top of it.
+    <p id="introText">Point your camera at one of our QR codes and its 3D model will appear standing on top of it.
        Works best with a printed code at least 5&nbsp;cm wide, in good light.</p>
     <button id="start" class="primary">Start camera</button>
     <div id="error"></div>
@@ -72,14 +72,6 @@
 <div id="hud" class="hidden"><div id="status"><span id="dot"></span><span id="statusText">Looking for a QR code…</span></div></div>
 
 <div id="controls" class="hidden">
-  <select id="modelSelect" title="Model">
-    <option value="builtin">Model: Crystal (built-in)</option>
-    <option value="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Duck/glTF-Binary/Duck.glb">Model: Duck</option>
-    <option value="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb">Model: Fox (animated)</option>
-    <option value="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb">Model: Helmet</option>
-  </select>
-  <label class="btn" for="file">Load .glb…</label>
-  <input id="file" type="file" accept=".glb,.gltf,model/gltf-binary" />
   <div class="slider">Size <input id="scale" type="range" min="0.3" max="3" step="0.05" value="1" /></div>
   <button id="flip" title="Switch camera">⟲ Camera</button>
 </div>
@@ -180,29 +172,92 @@ function setModel(obj, animations = []) {
   }
 }
 
-const loader = new GLTFLoader();
-const modelCache = new Map();
-let currentSource = null;
+// ---------- Models linked to QR codes (see models.json) ----------
+let config = { baseUrl: '', models: {} };
+try {
+  config = await (await fetch('models.json', { cache: 'no-cache' })).json();
+} catch (e) {
+  console.error('models.json could not be loaded', e);
+}
 
-async function loadModel(source) {
-  if (source === currentSource) return;
-  currentSource = source;
-  if (source === 'builtin') { setModel(builtinModel()); spinTarget = modelHolder.children[0].children[2]; return; }
-  setStatus('Loading model…', anchor.visible);
+// Which models.json entry does this QR text point at? Accepts "<baseUrl>?m=<key>" or just "<key>".
+function keyFromText(text) {
+  const t = text.trim();
+  if (config.models[t]) return t;
   try {
-    let gltf = modelCache.get(source);
-    if (!gltf) { gltf = await loader.loadAsync(source); modelCache.set(source, gltf); }
-    if (currentSource !== source) return; // user switched meanwhile
-    const obj = cloneSkinned(gltf.scene);   // keeps skeletons working for animated models
-    setModel(fitModel(obj), gltf.animations);
+    const u = new URL(t);
+    const k = u.searchParams.get('m');
+    if (!k || !config.models[k]) return null;
+    if (config.baseUrl && new URL(config.baseUrl).host !== u.host) return null;  // only our own codes
+    return k;
+  } catch { return null; }
+}
+
+const loader = new GLTFLoader();
+const gltfCache = new Map();            // file -> Promise<gltf>, so each file is downloaded once
+let currentKey = null, modelReady = false;
+
+function fetchGltf(file) {
+  if (!gltfCache.has(file)) gltfCache.set(file, loader.loadAsync(file).catch((e) => { gltfCache.delete(file); throw e; }));
+  return gltfCache.get(file);
+}
+
+function clearModel() {
+  modelHolder.clear(); mixer = null; spinTarget = null;
+  modelReady = false; anchor.visible = false; currentKey = null;
+}
+
+async function showModelFor(key) {
+  if (key === currentKey) { if (modelReady) setStatus(config.models[key].name || key, true); return; }
+  clearModel();
+  if (!key) return;
+  currentKey = key;
+  const entry = config.models[key];
+  try {
+    let obj, animations = [];
+    if (entry.file === 'builtin') {
+      obj = builtinModel();
+    } else {
+      setStatus('Loading ' + (entry.name || key) + '…', true);
+      const gltf = await fetchGltf(entry.file);
+      if (currentKey !== key) return;                 // a different code was scanned meanwhile
+      obj = fitModel(cloneSkinned(gltf.scene));       // SkeletonUtils clone keeps animations working
+      animations = gltf.animations;
+    }
+    const wrap = new THREE.Group();
+    wrap.add(obj);
+    wrap.scale.setScalar(entry.scale ?? 1);
+    wrap.rotation.y = THREE.MathUtils.degToRad(entry.rotationY ?? 0);
+    wrap.position.y = entry.offsetY ?? 0;
+    setModel(wrap);
+    spinTarget = entry.file === 'builtin' ? obj.children[2] : null;   // the built-in crystal spins
+    if (animations.length) {
+      const clip = typeof entry.animation === 'string'
+        ? THREE.AnimationClip.findByName(animations, entry.animation) : animations[entry.animation ?? 0];
+      if (clip) { mixer = new THREE.AnimationMixer(obj); mixer.clipAction(clip).play(); }
+    }
+    modelReady = true;
+    if (tracking) anchor.visible = true;
+    setStatus(entry.name || key, true);
   } catch (e) {
     console.error(e);
-    setStatus('Could not load that model – using the built-in one', anchor.visible);
-    currentSource = null;
-    loadModel('builtin');
+    if (currentKey === key) setStatus('Could not load the model for this code', false);
   }
 }
-loadModel('builtin');
+
+// Download every model in the background after the camera starts, so switching codes is instant.
+async function preloadAll() {
+  for (const entry of Object.values(config.models)) {
+    if (entry.file && entry.file !== 'builtin') { try { await fetchGltf(entry.file); } catch {} }
+  }
+}
+
+// If the page was opened by scanning one of our codes with the phone's camera app, say which model it is.
+{
+  const k = new URLSearchParams(location.search).get('m');
+  if (k && config.models[k]) $('introText').textContent =
+    'Tap Start, then point your camera at the QR code again to see “' + (config.models[k].name || k) + '” in 3D.';
+}
 
 // ---------- Camera ----------
 let facingMode = 'environment';
@@ -399,7 +454,7 @@ function applyPose(cornersTrack, now) {
   if (!M) return;
   anchor.matrix.copy(M);
   anchor.matrixWorldNeedsUpdate = true;
-  anchor.visible = true;
+  anchor.visible = modelReady;
   tracking = true;
   lastSeen = now;
 }
@@ -444,7 +499,6 @@ function startDecode(img, pyr, seq, now) {
     const corners = res.pts.map(([x, y]) => [rx + x, ry + y]);
     const textChanged = res.text !== lastText;
     onCodeText(res.text);
-    setStatus('Tracking: ' + (res.text.length > 40 ? res.text.slice(0, 40) + '…' : res.text), true);
     if (!tracker.active || textChanged) { initFrom(pyr, seq, corners, t); return; }
     // Drift check: compare the tracker's corners on that same frame with the decoded ones.
     const tc = history.get(seq);
@@ -480,9 +534,9 @@ function processFrame(now) {
 function onCodeText(text) {
   if (text === lastText) return;
   lastText = text;
-  // If the QR code itself points at a .glb/.gltf file, show that model.
-  if (/^https?:\/\/\S+\.(glb|gltf)(\?\S*)?$/i.test(text.trim())) loadModel(text.trim());
-  else loadModel($('modelSelect').value);
+  const key = keyFromText(text);
+  if (key) showModelFor(key);
+  else { clearModel(); setStatus('This QR code is not linked to a model', false); }
 }
 
 const clock = new THREE.Clock();
@@ -498,6 +552,7 @@ function frame() {
   if (tracking && !tracker.active && now - lastSeen > LOST_AFTER_MS) {
     tracking = false;
     anchor.visible = false;
+    lastText = '';
     filters.forEach(f => f.reset());
     setStatus('Looking for a QR code…', false);
   }
@@ -522,25 +577,13 @@ $('start').addEventListener('click', async () => {
     $('hud').classList.remove('hidden');
     $('controls').classList.remove('hidden');
     requestAnimationFrame(frame);
+    preloadAll();
   } catch (e) {
     console.error(e);
     $('error').textContent = e.name === 'NotAllowedError'
       ? 'Camera permission was denied. Allow camera access in your browser settings and try again.'
       : 'Could not start the camera: ' + e.message;
   }
-});
-
-$('modelSelect').addEventListener('change', (e) => { lastText = ''; currentSource = null; loadModel(e.target.value); });
-
-$('file').addEventListener('change', (e) => {
-  const f = e.target.files[0];
-  if (!f) return;
-  const url = URL.createObjectURL(f);
-  const opt = document.createElement('option');
-  opt.value = url; opt.textContent = 'Model: ' + f.name;
-  $('modelSelect').appendChild(opt);
-  $('modelSelect').value = url;
-  currentSource = null; loadModel(url);
 });
 
 $('scale').addEventListener('input', (e) => { userScale = parseFloat(e.target.value); });

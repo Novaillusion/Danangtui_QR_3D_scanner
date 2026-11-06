@@ -6,10 +6,28 @@ Browser-based AR: point your phone at any QR code and a 3D model appears standin
 
 ## Features
 - Works in the browser – no app install (Chrome, Safari, Firefox on phone or desktop)
-- Tracks the QR code's position and tilt in 3D and anchors the model to it
-- Built-in models (Crystal, Duck, Fox, Helmet) or load your own `.glb`
-- A QR code whose content is a URL ending in `.glb` / `.gltf` shows that model
-- Size slider and front/back camera switch
+- Each model is linked to its own QR code; other QR codes show nothing
+- Tracks the code's position and tilt every frame and anchors the model to it
+- Scanning a code with the phone's normal camera app opens the viewer
+
+## Adding your own models
+1. Put your `.glb` file in the `models/` folder (e.g. `models/dragon.glb`).
+2. Add an entry to [`models.json`](models.json). The key (`dragon`) becomes part of the QR code:
+   ```json
+   "dragon": { "name": "Dragon", "file": "models/dragon.glb" }
+   ```
+   Optional settings per model:
+   | field | meaning | default |
+   |---|---|---|
+   | `scale` | size multiplier (1 = fits the QR code) | `1` |
+   | `rotationY` | turn the model, in degrees | `0` |
+   | `offsetY` | lift above the code, in QR widths | `0` |
+   | `animation` | animation name or number to play | first one |
+3. Commit and push. Then open **[qr.html](https://novaillusion.github.io/Danangtui_QR_3D_scanner/qr.html)**
+   to print or download the QR code for each model.
+
+Each QR code contains `https://novaillusion.github.io/Danangtui_QR_3D_scanner/?m=<key>`.
+To remove a model, delete its entry; its old printed codes then show nothing.
 
 ## How it works
 1. **Find** – [jsQR](https://github.com/cozmo/jsQR) decodes the QR code in a Web Worker and returns its four corners.

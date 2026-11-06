@@ -1,0 +1,24 @@
+{
+  "baseUrl": "https://novaillusion.github.io/Danangtui_QR_3D_scanner/",
+  "models": {
+    "crystal": {
+      "name": "Crystal",
+      "file": "builtin"
+    },
+    "duck": {
+      "name": "Duck",
+      "file": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Duck/glTF-Binary/Duck.glb"
+    },
+    "fox": {
+      "name": "Fox",
+      "file": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb",
+      "animation": "Survey"
+    },
+    "helmet": {
+      "name": "Helmet",
+      "file": "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/DamagedHelmet/glTF-Binary/DamagedHelmet.glb",
+      "scale": 0.8,
+      "offsetY": 0.1
+    }
+  }
+}

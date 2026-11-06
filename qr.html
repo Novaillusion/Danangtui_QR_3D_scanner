@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>QR codes for 3D models</title>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<style>
+  :root { --fg: #14171f; --muted: #667085; --line: #e4e7ec; --accent: #2f6bff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--fg); background: #f6f7f9; }
+  header { padding: 28px 24px 8px; max-width: 1100px; margin: 0 auto; }
+  h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.02em; }
+  header p { margin: 0; color: var(--muted); line-height: 1.5; }
+  .bar { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+  button, a.btn { font: inherit; font-size: 14px; border: 1px solid var(--line); background: #fff; color: var(--fg);
+    border-radius: 10px; padding: 8px 14px; cursor: pointer; text-decoration: none; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; padding: 16px 24px 40px; max-width: 1100px; margin: 0 auto; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 16px; text-align: center; }
+  .card canvas { width: 100%; height: auto; image-rendering: pixelated; }
+  .card h2 { font-size: 17px; margin: 10px 0 2px; }
+  .card code { font-size: 11px; color: var(--muted); word-break: break-all; display: block; margin-bottom: 12px; }
+  #err { color: #c4320a; padding: 0 24px; max-width: 1100px; margin: 0 auto; }
+  @media print {
+    header, .card button, #err { display: none; }
+    body { background: #fff; }
+    main { grid-template-columns: repeat(2, 1fr); padding: 0; }
+    .card { border: 1px dashed #bbb; break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>QR codes for your 3D models</h1>
+  <p>Each code below opens its own model in the AR viewer. Codes are generated from <code>models.json</code>.
+     Print them at least 5&nbsp;cm wide. Scanning one with a normal camera app also opens the viewer.</p>
+  <div class="bar">
+    <button class="primary" onclick="window.print()">Print all</button>
+    <a class="btn" href="./">Open the AR viewer</a>
+  </div>
+</header>
+<div id="err"></div>
+<main id="grid"></main>
+
+<script>
+function drawQR(text, px = 1024) {
+  const qr = qrcode(0, 'Q');            // auto size, 25% error correction
+  qr.addData(text);
+  qr.make();
+  const n = qr.getModuleCount(), quiet = 4, total = n + quiet * 2;
+  const cell = Math.floor(px / total);
+  const c = document.createElement('canvas');
+  c.width = c.height = cell * total;
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = '#000';
+  for (let r = 0; r < n; r++) for (let col = 0; col < n; col++)
+    if (qr.isDark(r, col)) g.fillRect((col + quiet) * cell, (r + quiet) * cell, cell, cell);
+  return c;
+}
+
+(async () => {
+  try {
+    const config = await (await fetch('models.json', { cache: 'no-cache' })).json();
+    const base = config.baseUrl || new URL('./', location.href).href;
+    const grid = document.getElementById('grid');
+    for (const [key, entry] of Object.entries(config.models)) {
+      const text = base + '?m=' + encodeURIComponent(key);
+      const card = document.createElement('div');
+      card.className = 'card';
+      const canvas = drawQR(text);
+      const h2 = document.createElement('h2'); h2.textContent = entry.name || key;
+      const code = document.createElement('code'); code.textContent = text;
+      const dl = document.createElement('button'); dl.textContent = 'Download PNG';
+      dl.onclick = () => {
+        const a = document.createElement('a');
+        a.href = canvas.toDataURL('image/png'); a.download = 'qr-' + key + '.png'; a.click();
+      };
+      card.append(canvas, h2, code, dl);
+      grid.append(card);
+    }
+  } catch (e) {
+    document.getElementById('err').textContent = 'Could not read models.json: ' + e.message;
+  }
+})();
+</script>
+</body>
+</html>
