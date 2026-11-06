@@ -11,7 +11,8 @@ Browser-based AR: point your phone at any QR code and a 3D model appears standin
 - Scanning a code with the phone's normal camera app opens the viewer
 
 ## Adding your own models
-1. Put your `.glb` file in the `models/` folder (e.g. `models/dragon.glb`).
+1. Put your model in the `models/` folder (e.g. `models/dragon.glb`). Supported: `.glb` (recommended), `.gltf`, `.fbx`.
+   For `.fbx`, embed the textures when exporting, or put the texture files next to the `.fbx` in `models/`.
 2. Add an entry to [`models.json`](models.json). The key (`dragon`) becomes part of the QR code:
    ```json
    "dragon": { "name": "Dragon", "file": "models/dragon.glb" }

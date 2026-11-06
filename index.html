@@ -79,6 +79,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { QRTracker, toGray, buildPyramid } from './tracker.js';
 
@@ -193,13 +194,21 @@ function keyFromText(text) {
   } catch { return null; }
 }
 
-const loader = new GLTFLoader();
-const gltfCache = new Map();            // file -> Promise<gltf>, so each file is downloaded once
+const gltfLoader = new GLTFLoader();
+const fbxLoader = new FBXLoader();
+const modelCache = new Map();           // file -> Promise<{scene, animations}>, so each file is downloaded once
 let currentKey = null, modelReady = false;
 
-function fetchGltf(file) {
-  if (!gltfCache.has(file)) gltfCache.set(file, loader.loadAsync(file).catch((e) => { gltfCache.delete(file); throw e; }));
-  return gltfCache.get(file);
+// .glb / .gltf via GLTFLoader, .fbx via FBXLoader (both give a scene + animation clips).
+function fetchModel(file) {
+  if (!modelCache.has(file)) {
+    const isFbx = /\.fbx(\?|#|$)/i.test(file);
+    const p = isFbx
+      ? fbxLoader.loadAsync(file).then((group) => ({ scene: group, animations: group.animations || [] }))
+      : gltfLoader.loadAsync(file).then((gltf) => ({ scene: gltf.scene, animations: gltf.animations }));
+    modelCache.set(file, p.catch((e) => { modelCache.delete(file); throw e; }));
+  }
+  return modelCache.get(file);
 }
 
 function clearModel() {
@@ -219,7 +228,7 @@ async function showModelFor(key) {
       obj = builtinModel();
     } else {
       setStatus('Loading ' + (entry.name || key) + '…', true);
-      const gltf = await fetchGltf(entry.file);
+      const gltf = await fetchModel(entry.file);
       if (currentKey !== key) return;                 // a different code was scanned meanwhile
       obj = fitModel(cloneSkinned(gltf.scene));       // SkeletonUtils clone keeps animations working
       animations = gltf.animations;
@@ -248,7 +257,7 @@ async function showModelFor(key) {
 // Download every model in the background after the camera starts, so switching codes is instant.
 async function preloadAll() {
   for (const entry of Object.values(config.models)) {
-    if (entry.file && entry.file !== 'builtin') { try { await fetchGltf(entry.file); } catch {} }
+    if (entry.file && entry.file !== 'builtin') { try { await fetchModel(entry.file); } catch {} }
   }
 }
 

@@ -10,5 +10,8 @@
 3. Open `qr.html` on the live site to print the QR code for it.
 
 Tips:
-- Use `.glb` (single file). Keep it under ~10 MB so it loads quickly on phones.
+- Supported formats: `.glb` (best), `.gltf`, `.fbx`.
+- `.fbx` works too, but files are larger and slower to load on phones. When exporting FBX, enable
+  **Embed Media / Embed Textures**, or copy the texture images into this folder next to the `.fbx`.
+- Keep models under ~10 MB so they load quickly on phones.
 - Export from Blender with **File → Export → glTF 2.0**, format **glTF Binary (.glb)**.
