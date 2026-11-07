@@ -21,6 +21,7 @@
   .card canvas { width: 100%; height: auto; image-rendering: pixelated; }
   .card h2 { font-size: 17px; margin: 10px 0 2px; }
   .card code { font-size: 11px; color: var(--muted); word-break: break-all; display: block; margin-bottom: 12px; }
+  main.single { grid-template-columns: minmax(240px, 420px); justify-content: center; }
   #err { color: #c4320a; padding: 0 24px; max-width: 1100px; margin: 0 auto; }
   @media print {
     header, .card button, #err { display: none; }
@@ -65,7 +66,22 @@ function drawQR(text, px = 1024) {
     const config = await (await fetch('models.json', { cache: 'no-cache' })).json();
     const base = config.baseUrl || new URL('./', location.href).href;
     const grid = document.getElementById('grid');
-    for (const [key, entry] of Object.entries(config.models)) {
+    // qr.html?m=<key> shows just that model's code (used by the PC uploader's "Show QR code" button)
+    const only = new URLSearchParams(location.search).get('m');
+    let entries = Object.entries(config.models);
+    if (only) {
+      entries = entries.filter(([k]) => k === only);
+      grid.classList.add('single');
+      document.querySelector('header h1').textContent = entries.length
+        ? 'QR code for “' + (entries[0][1].name || only) + '”'
+        : 'No model with the key “' + only + '” yet';
+      const all = document.createElement('a');
+      all.className = 'btn'; all.href = 'qr.html'; all.textContent = 'Show all codes';
+      document.querySelector('.bar').append(all);
+      if (!entries.length) document.getElementById('err').textContent =
+        'If you just uploaded it, wait a minute for the website to update, then reload this page.';
+    }
+    for (const [key, entry] of entries) {
       const text = base + '?m=' + encodeURIComponent(key);
       const card = document.createElement('div');
       card.className = 'card';
