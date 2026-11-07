@@ -2,7 +2,7 @@ extends Node
 ## Small client for the GitHub "contents" API of one repository.
 ## Every call returns a Dictionary: { ok: bool, code: int, data: Variant, error: String, ... }
 
-var owner := ""
+var repo_owner := ""
 var repo := ""
 var branch := "main"
 var token := ""
@@ -10,7 +10,7 @@ var token := ""
 
 func api_url(path: String) -> String:
 	var encoded := path.uri_encode().replace("%2F", "/")
-	return "https://api.github.com/repos/%s/%s/contents/%s" % [owner, repo, encoded]
+	return "https://api.github.com/repos/%s/%s/contents/%s" % [repo_owner, repo, encoded]
 
 
 func headers(accept: String = "application/vnd.github+json") -> PackedStringArray:
@@ -67,7 +67,7 @@ func request(method: int, url: String, body: String = "", hdrs: PackedStringArra
 ## Check that the repo exists and the token may push to it.
 func check_access() -> Dictionary:
 	var r: Dictionary = await request(HTTPClient.METHOD_GET,
-		"https://api.github.com/repos/%s/%s" % [owner, repo], "", headers())
+		"https://api.github.com/repos/%s/%s" % [repo_owner, repo], "", headers())
 	if r["ok"] and r["data"] is Dictionary:
 		var perms = r["data"].get("permissions", {})
 		if perms is Dictionary and not perms.get("push", false):

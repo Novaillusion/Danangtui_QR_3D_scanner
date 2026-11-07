@@ -294,7 +294,7 @@ func _update_buttons() -> void:
 
 func _load_settings() -> void:
 	settings.load(SETTINGS_PATH)  # missing file is fine: defaults below
-	gh.owner = settings.get_value("github", "owner", DEFAULT_OWNER)
+	gh.repo_owner = settings.get_value("github", "owner", DEFAULT_OWNER)
 	gh.repo = settings.get_value("github", "repo", DEFAULT_REPO)
 	gh.branch = settings.get_value("github", "branch", "main")
 	gh.token = settings.get_value("github", "token", "")
@@ -302,7 +302,7 @@ func _load_settings() -> void:
 
 
 func _open_settings() -> void:
-	s_owner.text = gh.owner
+	s_owner.text = gh.repo_owner
 	s_repo.text = gh.repo
 	s_branch.text = gh.branch
 	s_token.text = gh.token
@@ -311,25 +311,25 @@ func _open_settings() -> void:
 
 
 func _on_settings_saved() -> void:
-	gh.owner = s_owner.text.strip_edges()
+	gh.repo_owner = s_owner.text.strip_edges()
 	gh.repo = s_repo.text.strip_edges()
 	gh.branch = s_branch.text.strip_edges() if s_branch.text.strip_edges() != "" else "main"
 	gh.token = s_token.text.strip_edges()
 	site_url = _with_slash(s_site.text.strip_edges())
-	settings.set_value("github", "owner", gh.owner)
+	settings.set_value("github", "owner", gh.repo_owner)
 	settings.set_value("github", "repo", gh.repo)
 	settings.set_value("github", "branch", gh.branch)
 	settings.set_value("github", "token", gh.token)
 	settings.set_value("site", "url", site_url)
 	settings.save(SETTINGS_PATH)
 	_set_busy(true)
-	_set_status("Checking access to %s/%s…" % [gh.owner, gh.repo])
+	_set_status("Checking access to %s/%s…" % [gh.repo_owner, gh.repo])
 	var r: Dictionary = await gh.check_access()
 	_set_busy(false)
 	if not r["ok"]:
 		_set_status(r["error"], true)
 		return
-	_set_status("Connected to %s/%s." % [gh.owner, gh.repo])
+	_set_status("Connected to %s/%s." % [gh.repo_owner, gh.repo])
 	_refresh()
 
 
@@ -780,8 +780,8 @@ func _fit_model() -> void:
 			box = box.merge(b)
 	if first:
 		return
-	var size := box.size
-	var s := 0.9 / maxf(maxf(size.x, size.z), maxf(size.y * 0.8, 0.000001))
+	var box_size := box.size
+	var s := 0.9 / maxf(maxf(box_size.x, box_size.z), maxf(box_size.y * 0.8, 0.000001))
 	var c := box.get_center()
 	model_root.scale = Vector3.ONE * s
 	model_root.position = Vector3(-c.x * s, -box.position.y * s, -c.z * s)
