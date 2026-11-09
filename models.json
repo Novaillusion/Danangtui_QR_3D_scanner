@@ -50,7 +50,7 @@
         "sunColor": "#ffffff",
         "sunAzimuth": 27.0,
         "sunElevation": 53.0,
-        "exposure": 1.0,
+        "exposure": 2.0,
         "shadow": 0.55
       }
     }
