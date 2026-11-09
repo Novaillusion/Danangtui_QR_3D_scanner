@@ -17,6 +17,14 @@ A small PC app that uploads 3D models to the QR AR website and links each one to
 
 The token is stored only on this PC (in Godot's user data folder, `user://settings.cfg`).
 
+## Preview controls
+| action | how |
+|---|---|
+| Orbit | left-drag |
+| Pan | **Space + left-drag**, or middle-drag |
+| Zoom | **Ctrl + Shift + left-drag** (up = in, down = out), or mouse wheel |
+| Reset view | **F** (mouse over the view) |
+
 ## Add a model
 1. **+ New** → **Choose file…** (`.glb` or `.fbx`), or drag the file from Explorer onto the window.
 2. Use the tabs on the right:

@@ -78,7 +78,9 @@ var cam: Camera3D
 var wrap: Node3D            # user transform (same as the website's wrap group)
 var model_root: Node3D      # fitted model: 0.9 of the QR width, standing on the code
 var anim_player: AnimationPlayer
-var dragging := false
+var dragging := false       # left button held in the view
+var mid_dragging := false   # middle button held (pans)
+var preview_box: SubViewportContainer
 var yaw := 0.6
 var pitch := -0.55
 var dist := 2.6
@@ -149,6 +151,11 @@ func _build_ui() -> void:
 	svc.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	svc.custom_minimum_size = Vector2(380, 300)
 	svc.gui_input.connect(_on_preview_input)
+	# The view takes keyboard focus while the mouse is over it, so holding Space pans the view
+	# instead of "pressing" whatever button had focus.
+	svc.focus_mode = Control.FOCUS_ALL
+	svc.mouse_entered.connect(func(): svc.grab_focus())
+	preview_box = svc
 	center.add_child(svc)
 	viewport = SubViewport.new()
 	viewport.own_world_3d = true
@@ -156,7 +163,8 @@ func _build_ui() -> void:
 	svc.add_child(viewport)
 	_build_preview_scene()
 	var hint := Label.new()
-	hint.text = "Drag to orbit · scroll to zoom · the square is the QR code (1 unit wide) · drop .glb/.fbx or images onto this window"
+	hint.text = "Drag: orbit · Space + drag or middle-drag: pan · Ctrl + Shift + drag or scroll: zoom · F: reset view\n" \
+		+ "The square is the QR code (1 unit wide). Drop .glb/.fbx models or images onto this window."
 	hint.modulate = Color(1, 1, 1, 0.55)
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	center.add_child(hint)
@@ -1294,21 +1302,56 @@ func _update_camera() -> void:
 
 
 func _on_preview_input(ev: InputEvent) -> void:
+	if ev is InputEventKey:
+		var k := ev as InputEventKey
+		if k.keycode == KEY_SPACE:
+			preview_box.accept_event()   # Space is for panning here, not for pressing buttons
+		elif k.pressed and not k.echo and k.keycode == KEY_F:
+			_reset_view()
+			preview_box.accept_event()
+		return
 	if ev is InputEventMouseButton:
 		var mb := ev as InputEventMouseButton
 		if mb.button_index == MOUSE_BUTTON_LEFT:
 			dragging = mb.pressed
+			if mb.pressed:
+				preview_box.grab_focus()
+		elif mb.button_index == MOUSE_BUTTON_MIDDLE:
+			mid_dragging = mb.pressed
 		elif mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_UP:
-			dist = maxf(0.6, dist * 0.9)
-			_update_camera()
+			_zoom(0.9)
 		elif mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			dist = minf(15.0, dist * 1.1)
-			_update_camera()
-	elif ev is InputEventMouseMotion and dragging:
+			_zoom(1.1)
+	elif ev is InputEventMouseMotion and (dragging or mid_dragging):
 		var mm := ev as InputEventMouseMotion
-		yaw -= mm.relative.x * 0.01
-		pitch = clampf(pitch - mm.relative.y * 0.01, -1.5, 0.3)
-		_update_camera()
+		if mid_dragging or Input.is_key_pressed(KEY_SPACE):
+			_pan(mm.relative)
+		elif mm.ctrl_pressed and mm.shift_pressed:
+			_zoom(exp(mm.relative.y * 0.01))   # drag up = zoom in, drag down = zoom out
+		else:
+			yaw -= mm.relative.x * 0.01
+			pitch = clampf(pitch - mm.relative.y * 0.01, -1.5, 0.3)
+			_update_camera()
+
+
+## Move the orbit centre so the scene follows the mouse.
+func _pan(delta: Vector2) -> void:
+	var world_per_px := 2.0 * dist * tan(deg_to_rad(cam.fov) * 0.5) / maxf(1.0, float(viewport.size.y))
+	var b := cam.global_transform.basis
+	pivot.position += (-b.x * delta.x + b.y * delta.y) * world_per_px
+
+
+func _zoom(factor: float) -> void:
+	dist = clampf(dist * factor, 0.2, 30.0)
+	_update_camera()
+
+
+func _reset_view() -> void:
+	pivot.position = Vector3(0, 0.35, 0)
+	yaw = 0.6
+	pitch = -0.55
+	dist = 2.6
+	_update_camera()
 
 
 func _clear_preview() -> void:
