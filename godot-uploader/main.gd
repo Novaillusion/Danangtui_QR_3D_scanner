@@ -81,6 +81,12 @@ var anim_player: AnimationPlayer
 var dragging := false       # left button held in the view
 var mid_dragging := false   # middle button held (pans)
 var preview_box: SubViewportContainer
+var progress_bar: ProgressBar
+var progress_total := 1     # steps in the current upload/update
+var progress_done := 0      # finished steps
+var progress_shown := 0.0   # 0..1 shown on the bar (creeps forward while a step is running)
+var done_dialog: AcceptDialog
+var done_qr_btn: Button
 var yaw := 0.6
 var pitch := -0.55
 var dist := 2.6
@@ -192,6 +198,13 @@ func _build_ui() -> void:
 	brow.add_child(qr_btn)
 	delete_btn = _button("Delete", func(): confirm_delete.popup_centered())
 	brow.add_child(delete_btn)
+	progress_bar = ProgressBar.new()
+	progress_bar.min_value = 0
+	progress_bar.max_value = 100
+	progress_bar.show_percentage = true
+	progress_bar.custom_minimum_size.y = 22
+	progress_bar.visible = false
+	right.add_child(progress_bar)
 	status_label = Label.new()
 	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	status_label.custom_minimum_size = Vector2(380, 60)
@@ -345,6 +358,16 @@ func _build_dialogs() -> void:
 	tex_dialog.title = "Choose a texture image"
 	tex_dialog.file_selected.connect(_on_texture_picked)
 	add_child(tex_dialog)
+
+	done_dialog = AcceptDialog.new()
+	done_dialog.title = "Upload successful"
+	done_qr_btn = done_dialog.add_button("Show QR code", true, "qr")
+	done_dialog.custom_action.connect(func(action):
+		if action == "qr":
+			done_dialog.hide()
+			_on_show_qr()
+	)
+	add_child(done_dialog)
 
 	confirm_delete = ConfirmationDialog.new()
 	confirm_delete.title = "Delete model"
@@ -1037,6 +1060,12 @@ func _on_upload() -> void:
 		return
 
 	_set_busy(true)
+	var uploaded_file := picked_path != ""
+	var tex_count := 0
+	for nm in mat_overrides:
+		if str(mat_overrides[nm].get("map", "")).begins_with("local:"):
+			tex_count += 1
+	_progress_start((1 if uploaded_file else 0) + tex_count + 2)   # files + models.json + refresh
 	var entry: Dictionary = (models.get(selected_key, {}) as Dictionary).duplicate(true)
 	entry["name"] = display_name
 
@@ -1056,6 +1085,7 @@ func _on_upload() -> void:
 		if not ok:
 			return
 		entry["file"] = repo_path
+		_progress_next()
 
 	# 2) textures loaded from this PC
 	for nm in mat_overrides.keys():
@@ -1077,6 +1107,7 @@ func _on_upload() -> void:
 			return
 		tex_cache[tpath] = tex_cache.get(mp)
 		mat_overrides[nm]["map"] = tpath
+		_progress_next()
 
 	# 3) settings used by the website
 	var uniform: bool = scale_lock.button_pressed
@@ -1132,15 +1163,21 @@ func _on_upload() -> void:
 			return
 		await get_tree().create_timer(1.5 * (attempt + 1)).timeout
 
+	_progress_next()
 	selected_key = key
 	picked_path = ""
 	form_title.text = "Edit: " + display_name
 	upload_btn.text = "Save changes"
 	file_label.text = str(entry.get("file", ""))
 	_set_busy(false)
+	_set_status("Refreshing the model list…")
 	await _refresh()
 	_show_material_ui()
+	_progress_finish()
 	_set_status("Done! '%s' is saved. The website updates in about 1 minute. Click 'Show QR' to print its code." % display_name)
+	_notify("Upload successful" if uploaded_file else "Saved successfully",
+		("Uploaded successfully!\n\n" if uploaded_file else "Changes saved successfully!\n\n") \
+		+ "'%s' (QR key: %s) will appear on the website in about 1 minute." % [display_name, key])
 
 
 ## Create or overwrite a file in the repo. Shows the error and returns false on failure.
@@ -1165,6 +1202,7 @@ func _on_delete() -> void:
 		return
 	var key := selected_key
 	_set_busy(true)
+	_progress_start(3)
 	_set_status("Removing '%s'…" % key)
 	var mj: Dictionary = await gh.get_file("models.json")
 	if not mj["ok"]:
@@ -1174,6 +1212,7 @@ func _on_delete() -> void:
 	if not (cfg is Dictionary) or not cfg.has("models"):
 		_fail("models.json in the repo is not valid JSON.")
 		return
+	_progress_next()
 	var old_entry: Dictionary = cfg["models"].get(key, {})
 	cfg["models"].erase(key)
 	var put: Dictionary = await gh.put_file("models.json", (JSON.stringify(cfg, "  ", false) + "\n").to_utf8_buffer(),
@@ -1182,6 +1221,7 @@ func _on_delete() -> void:
 		_fail("Could not update models.json: " + put["error"])
 		return
 	# delete the model file and its textures if they live in the repo and nothing else uses them
+	_progress_next()
 	var files := [str(old_entry.get("file", ""))]
 	var mats: Dictionary = old_entry.get("materials", {})
 	for nm in mats:
@@ -1195,7 +1235,9 @@ func _on_delete() -> void:
 	_set_busy(false)
 	_new_model()
 	await _refresh()
+	_progress_finish()
 	_set_status("'%s' was removed from the website." % key)
+	_notify("Deleted", "'%s' was removed from the website. Its printed QR codes will now show nothing." % key, false)
 
 
 func _on_show_qr() -> void:
@@ -1203,7 +1245,51 @@ func _on_show_qr() -> void:
 		OS.shell_open(site_url + "qr.html?m=" + selected_key.uri_encode())
 
 
+# ---- progress + notifications ----
+
+func _progress_start(steps: int) -> void:
+	progress_total = maxi(1, steps)
+	progress_done = 0
+	progress_shown = 0.0
+	progress_bar.value = 0
+	progress_bar.modulate = Color.WHITE
+	progress_bar.visible = true
+
+
+func _progress_next() -> void:
+	progress_done = mini(progress_done + 1, progress_total)
+	progress_shown = maxf(progress_shown, float(progress_done) / progress_total)
+
+
+func _progress_finish() -> void:
+	progress_done = progress_total
+	progress_shown = 1.0
+	progress_bar.value = 100
+	progress_bar.modulate = Color("8ff0a4")
+	await get_tree().create_timer(2.5).timeout
+	if not busy:
+		progress_bar.visible = false
+
+
+## While a step runs (GitHub doesn't report upload bytes), creep towards the end of that step.
+func _process(delta: float) -> void:
+	if progress_bar == null or not progress_bar.visible or progress_done >= progress_total:
+		return
+	var step_end := float(progress_done + 1) / progress_total
+	var cap := step_end - 0.1 / progress_total
+	progress_shown += (cap - progress_shown) * minf(1.0, delta * 0.6)
+	progress_bar.value = progress_shown * 100.0
+
+
+func _notify(title_text: String, message: String, offer_qr: bool = true) -> void:
+	done_dialog.title = title_text
+	done_dialog.dialog_text = message
+	done_qr_btn.visible = offer_qr
+	done_dialog.popup_centered()
+
+
 func _fail(msg: String) -> void:
+	progress_bar.visible = false
 	_set_busy(false)
 	_set_status(msg, true)
 

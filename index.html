@@ -32,6 +32,9 @@
     max-width: 92vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #dot { width: 9px; height: 9px; border-radius: 50%; background: #f5b942; flex: none; }
   #dot.on { background: #3ddc84; box-shadow: 0 0 8px #3ddc84; }
+  #dot.loading { width: 14px; height: 14px; background: none; box-shadow: none;
+    border: 2px solid rgba(255,255,255,0.25); border-top-color: #4f8cff; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   #controls { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
     padding: 12px; padding-bottom: max(12px, env(safe-area-inset-bottom));
@@ -135,6 +138,21 @@ anchor.add(shadow);
 
 const modelHolder = new THREE.Group();
 anchor.add(modelHolder);
+
+// Spinning ring shown on the QR code while its model is loading
+const loadingRing = new THREE.Group();
+{
+  const arc = new THREE.Mesh(new THREE.RingGeometry(0.28, 0.36, 48, 1, 0, Math.PI * 1.5),
+    new THREE.MeshBasicMaterial({ color: 0x4f8cff, transparent: true, opacity: 0.95, side: THREE.DoubleSide, depthTest: false }));
+  const track = new THREE.Mesh(new THREE.RingGeometry(0.28, 0.36, 48),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthTest: false }));
+  arc.renderOrder = track.renderOrder = 10;
+  loadingRing.add(track, arc);
+  loadingRing.rotation.x = -Math.PI / 2;
+  loadingRing.position.y = 0.01;
+  loadingRing.visible = false;
+  anchor.add(loadingRing);
+}
 
 let mixer = null;
 let spinTarget = null;   // built-in model spins gently
@@ -254,14 +272,25 @@ const gltfLoader = new GLTFLoader();
 const fbxLoader = new FBXLoader();
 const modelCache = new Map();           // file -> Promise<{scene, animations}>, so each file is downloaded once
 let currentKey = null, modelReady = false;
+let modelLoading = false, loadingFile = null, loadingName = '';
+const loadProgress = new Map();         // file -> 0..1 while downloading
+
+const onProgress = (file) => (e) => { if (e.total) loadProgress.set(file, e.loaded / e.total); };
+
+function setLoading(on, file = null, name = '') {
+  modelLoading = on; loadingFile = file; loadingName = name;
+  loadingRing.visible = on;
+  dot.classList.toggle('loading', on);
+  if (tracking) anchor.visible = modelReady || modelLoading;
+}
 
 // .glb / .gltf via GLTFLoader, .fbx via FBXLoader (both give a scene + animation clips).
 function fetchModel(file) {
   if (!modelCache.has(file)) {
     const isFbx = /\.fbx(\?|#|$)/i.test(file);
     const p = isFbx
-      ? fbxLoader.loadAsync(file).then((group) => ({ scene: group, animations: group.animations || [] }))
-      : gltfLoader.loadAsync(file).then((gltf) => ({ scene: gltf.scene, animations: gltf.animations }));
+      ? fbxLoader.loadAsync(file, onProgress(file)).then((group) => ({ scene: group, animations: group.animations || [] }))
+      : gltfLoader.loadAsync(file, onProgress(file)).then((gltf) => ({ scene: gltf.scene, animations: gltf.animations }));
     modelCache.set(file, p.catch((e) => { modelCache.delete(file); throw e; }));
   }
   return modelCache.get(file);
@@ -271,6 +300,8 @@ function clearModel() {
   modelHolder.clear(); mixer = null; spinTarget = null;
   applyLighting();
   modelReady = false; anchor.visible = false; currentKey = null;
+  shadow.visible = false;
+  setLoading(false);
 }
 
 async function showModelFor(key) {
@@ -284,6 +315,7 @@ async function showModelFor(key) {
     if (entry.file === 'builtin') {
       obj = builtinModel();
     } else {
+      setLoading(true, entry.file, entry.name || key);
       setStatus('Loading ' + (entry.name || key) + '…', true);
       const gltf = await fetchModel(entry.file);
       if (currentKey !== key) return;                 // a different code was scanned meanwhile
@@ -310,11 +342,13 @@ async function showModelFor(key) {
       if (clip) { mixer = new THREE.AnimationMixer(obj); mixer.clipAction(clip).play(); }
     }
     modelReady = true;
+    shadow.visible = true;
+    setLoading(false);
     if (tracking) anchor.visible = true;
     setStatus(entry.name || key, true);
   } catch (e) {
     console.error(e);
-    if (currentKey === key) setStatus('Could not load the model for this code', false);
+    if (currentKey === key) { setLoading(false); setStatus('Could not load the model for this code', false); }
   }
 }
 
@@ -528,7 +562,7 @@ function applyPose(cornersTrack, now) {
   anchor.matrix.copy(M);
   hemi.position.set(M.elements[4], M.elements[5], M.elements[6]);   // sky = the code's "up"
   anchor.matrixWorldNeedsUpdate = true;
-  anchor.visible = modelReady;
+  anchor.visible = modelReady || modelLoading;
   tracking = true;
   lastSeen = now;
 }
@@ -632,6 +666,11 @@ function frame() {
   }
 
   modelHolder.scale.setScalar(userScale);
+  if (modelLoading) {
+    loadingRing.children[1].rotation.z -= dt * 5;
+    const p = loadProgress.get(loadingFile);
+    if (tracking) statusText.textContent = 'Loading ' + loadingName + '…' + (p ? ' ' + Math.round(p * 100) + '%' : '');
+  }
   if (spinTarget) { spinTarget.rotation.y += dt * 1.2; spinTarget.position.y = 0.6 + Math.sin(now / 600) * 0.04; }
   if (mixer) mixer.update(dt);
   renderer.render(scene, camera);
