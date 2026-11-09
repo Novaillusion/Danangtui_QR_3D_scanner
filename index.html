@@ -39,11 +39,12 @@
   @keyframes spin { to { transform: rotate(360deg); } }
 
   /* Brand logo, top-right of the scanning screen */
-  #logo { position: fixed; z-index: 11; pointer-events: none;
+  #logo { position: fixed; z-index: 11; cursor: pointer; -webkit-tap-highlight-color: transparent;
     top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
     width: 56px; height: 56px; padding: 6px; border-radius: 14px;
     background: rgba(255,255,255,0.88); box-shadow: 0 2px 10px rgba(0,0,0,0.25); }
   #logo img { width: 100%; height: 100%; display: block; }
+  #logo:active { transform: scale(0.94); }
   /* keep the status chip clear of the logo on narrow phones */
   #status { max-width: calc(100vw - 2 * 84px); }
 
@@ -83,7 +84,7 @@
   </div>
 </div>
 
-<div id="logo" class="hidden"><img src="logo.png" alt="Logo" /></div>
+<a id="logo" class="hidden" href="https://danangtui.vn/" target="_blank" rel="noopener" title="Đà Nẵng tui – Creative and Cultural Hub"><img src="logo.png" alt="Đà Nẵng tui" /></a>
 <div id="hud" class="hidden"><div id="status"><span id="dot"></span><span id="statusText">Looking for a QR code…</span></div></div>
 
 <div id="controls" class="hidden">
