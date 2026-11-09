@@ -102,10 +102,8 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000); // stays at origin looking down -Z
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
-const sun = new THREE.DirectionalLight(0xffffff, 2.2);
-sun.position.set(1, 3, 2);
-scene.add(sun);
+const hemi = new THREE.HemisphereLight(0xffffff, 0x445566, 1.6);
+scene.add(hemi);
 
 // "anchor" follows the QR code. Local frame: x = right along the code, y = up out of the code,
 // z = toward the bottom edge of the code. 1 unit = width of the QR code.
@@ -114,17 +112,23 @@ anchor.matrixAutoUpdate = false;
 anchor.visible = false;
 scene.add(anchor);
 
+// The sun is attached to the QR code, so lighting stays the same relative to the model
+// as you walk around it (direction set per model in models.json → "lighting").
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+anchor.add(sun);
+anchor.add(sun.target);
+
 // Soft contact shadow under the model
 const shadowTex = (() => {
   const c = document.createElement('canvas'); c.width = c.height = 128;
   const g = c.getContext('2d');
   const grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
-  grd.addColorStop(0, 'rgba(0,0,0,0.55)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
+  grd.addColorStop(0, 'rgba(0,0,0,1)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
   g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
   return new THREE.CanvasTexture(c);
 })();
 const shadow = new THREE.Mesh(new THREE.PlaneGeometry(1.3, 1.3),
-  new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false }));
+  new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false, opacity: 0.55 }));
 shadow.rotation.x = -Math.PI / 2;
 shadow.position.y = 0.002;
 anchor.add(shadow);
@@ -134,6 +138,58 @@ anchor.add(modelHolder);
 
 let mixer = null;
 let spinTarget = null;   // built-in model spins gently
+
+// ---------- Per-model lighting ----------
+const DEFAULT_LIGHTING = { ambient: 1.6, ambientColor: '#ffffff', sun: 2.2, sunColor: '#ffffff',
+  sunAzimuth: 26.6, sunElevation: 53.3, exposure: 1.0, shadow: 0.55 };
+function applyLighting(lighting) {
+  const L = { ...DEFAULT_LIGHTING, ...(lighting || {}) };
+  hemi.intensity = L.ambient; hemi.color.set(L.ambientColor);
+  sun.intensity = L.sun; sun.color.set(L.sunColor);
+  const az = THREE.MathUtils.degToRad(L.sunAzimuth), el = THREE.MathUtils.degToRad(L.sunElevation);
+  sun.position.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)).multiplyScalar(5);
+  renderer.toneMappingExposure = L.exposure;
+  shadow.material.opacity = L.shadow;
+}
+applyLighting();
+
+// ---------- Per-model material overrides ----------
+// "materials": { "*": {...all materials...}, "<material name>": {...} }
+// fields: color, metalness, roughness, emissive, emissiveIntensity, opacity, map ("" removes the texture)
+const texLoader = new THREE.TextureLoader();
+const texCache = new Map();
+function loadTexture(file, flipY) {
+  const k = file + '|' + flipY;
+  if (!texCache.has(k)) texCache.set(k, texLoader.loadAsync(file).then((t) => {
+    t.colorSpace = THREE.SRGBColorSpace; t.flipY = flipY; t.needsUpdate = true; return t;
+  }));
+  return texCache.get(k);
+}
+async function applyMaterials(root, mats, isFbx) {
+  if (!mats) return;
+  const jobs = [];
+  root.traverse((o) => {
+    if (!o.isMesh || !o.material) return;
+    const list = Array.isArray(o.material) ? o.material : [o.material];
+    const out = list.map((m) => {
+      const ov = { ...(mats['*'] || {}), ...(mats[m.name] || {}) };
+      if (!Object.keys(ov).length) return m;
+      const c = m.clone();
+      if (ov.color != null && c.color) c.color.set(ov.color);
+      if (ov.metalness != null && 'metalness' in c) c.metalness = ov.metalness;
+      if (ov.roughness != null && 'roughness' in c) c.roughness = ov.roughness;
+      if (ov.emissive != null && c.emissive) c.emissive.set(ov.emissive);
+      if (ov.emissiveIntensity != null && 'emissiveIntensity' in c) c.emissiveIntensity = ov.emissiveIntensity;
+      if (ov.opacity != null) { c.opacity = ov.opacity; c.transparent = ov.opacity < 1; c.depthWrite = ov.opacity >= 1; }
+      if (ov.map === '') c.map = null;
+      else if (ov.map) jobs.push(loadTexture(ov.map, !isFbx).then((t) => { c.map = t; c.needsUpdate = true; }));
+      c.needsUpdate = true;
+      return c;
+    });
+    o.material = Array.isArray(o.material) ? out : out[0];
+  });
+  await Promise.all(jobs.map((j) => j.catch((e) => console.error('texture', e))));
+}
 
 function builtinModel() {
   const g = new THREE.Group();
@@ -213,6 +269,7 @@ function fetchModel(file) {
 
 function clearModel() {
   modelHolder.clear(); mixer = null; spinTarget = null;
+  applyLighting();
   modelReady = false; anchor.visible = false; currentKey = null;
 }
 
@@ -233,11 +290,18 @@ async function showModelFor(key) {
       obj = fitModel(cloneSkinned(gltf.scene));       // SkeletonUtils clone keeps animations working
       animations = gltf.animations;
     }
+    await applyMaterials(obj, entry.materials, /\.fbx(\?|#|$)/i.test(entry.file || ''));
+    if (currentKey !== key) return;
+    // Transform: position/rotation (degrees, XYZ order)/scale; older entries used rotationY/offsetY.
     const wrap = new THREE.Group();
     wrap.add(obj);
-    wrap.scale.setScalar(entry.scale ?? 1);
-    wrap.rotation.y = THREE.MathUtils.degToRad(entry.rotationY ?? 0);
-    wrap.position.y = entry.offsetY ?? 0;
+    const sc = entry.scale ?? 1;
+    if (Array.isArray(sc)) wrap.scale.set(sc[0], sc[1], sc[2]); else wrap.scale.setScalar(sc);
+    const pos = entry.position ?? [0, entry.offsetY ?? 0, 0];
+    wrap.position.set(pos[0], pos[1], pos[2]);
+    const rot = (entry.rotation ?? [0, entry.rotationY ?? 0, 0]).map(THREE.MathUtils.degToRad);
+    wrap.rotation.set(rot[0], rot[1], rot[2], 'XYZ');
+    applyLighting(entry.lighting);
     setModel(wrap);
     spinTarget = entry.file === 'builtin' ? obj.children[2] : null;   // the built-in crystal spins
     if (animations.length) {
@@ -462,6 +526,7 @@ function applyPose(cornersTrack, now) {
   const M = poseFromCorners(filterCorners(pts, now / 1000));
   if (!M) return;
   anchor.matrix.copy(M);
+  hemi.position.set(M.elements[4], M.elements[5], M.elements[6]);   // sky = the code's "up"
   anchor.matrixWorldNeedsUpdate = true;
   anchor.visible = modelReady;
   tracking = true;

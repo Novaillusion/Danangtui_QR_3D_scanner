@@ -17,13 +17,15 @@ Browser-based AR: point your phone at any QR code and a 3D model appears standin
    ```json
    "dragon": { "name": "Dragon", "file": "models/dragon.glb" }
    ```
-   Optional settings per model:
+   Optional settings per model (the PC uploader app in `godot-uploader/` sets these for you):
    | field | meaning | default |
    |---|---|---|
-   | `scale` | size multiplier (1 = fits the QR code) | `1` |
-   | `rotationY` | turn the model, in degrees | `0` |
-   | `offsetY` | lift above the code, in QR widths | `0` |
+   | `position` | `[x, y, z]` offset, in QR widths (y = up from the code) | `[0, 0, 0]` |
+   | `rotation` | `[x, y, z]` in degrees (XYZ order) | `[0, 0, 0]` |
+   | `scale` | number, or `[x, y, z]` (1 = fits the QR code) | `1` |
    | `animation` | animation name or number to play | first one |
+   | `lighting` | `ambient`, `ambientColor`, `sun`, `sunColor`, `sunAzimuth`, `sunElevation`, `exposure`, `shadow` | see `index.html` |
+   | `materials` | `{ "*": {...}, "<material name>": {...} }` with `color`, `metalness`, `roughness`, `emissive`, `emissiveIntensity`, `opacity`, `map` (texture path, `""` removes it) | model's own |
 3. Commit and push. Then open **[qr.html](https://novaillusion.github.io/Danangtui_QR_3D_scanner/qr.html)**
    to print or download the QR code for each model.
 

@@ -18,11 +18,17 @@ A small PC app that uploads 3D models to the QR AR website and links each one to
 The token is stored only on this PC (in Godot's user data folder, `user://settings.cfg`).
 
 ## Add a model
-1. **+ New model** → **Choose file…** (`.glb` or `.fbx`).
-2. Check the preview: the square is the QR code. Adjust **Size**, **Rotation** and **Lift**.
-3. Give it a **Name**; the **QR key** is filled in automatically (you can change it).
-4. **Upload to website**. After about a minute it's live.
-5. **Show QR code** opens the printable code in your browser.
+1. **+ New** → **Choose file…** (`.glb` or `.fbx`), or drag the file from Explorer onto the window.
+2. Use the tabs on the right:
+   - **Model** – name, QR key (filled in automatically), animation.
+   - **Transform** – position, rotation and scale (X/Y/Z; tick *Uniform scale* to scale evenly).
+     Units are QR-code widths.
+   - **Lighting** – ambient and sun brightness/colour, sun direction and height, exposure, ground shadow.
+   - **Material** – pick *All materials* or one material, then change base colour, metalness, roughness,
+     glow, opacity, or replace its texture with an image from this PC (or drop a .png/.jpg on the window).
+3. **Upload to website**. The model, any new textures and all settings are uploaded; after about a
+   minute the phone AR view looks the same as the preview.
+4. **Show QR** opens the printable code in your browser.
 
 ## Edit or delete
 Select a model in the list on the left. Change its settings and **Save changes**, choose a new file

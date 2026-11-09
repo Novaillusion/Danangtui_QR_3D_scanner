@@ -1,7 +1,8 @@
 extends Control
 ## QR 3D Uploader
-## Pick a .glb/.fbx model, preview it standing on a QR code, and upload it to the
-## GitHub repo behind the QR AR website. Each model gets its own QR key in models.json.
+## Load a .glb/.fbx model from this PC, adjust its transform, lighting and materials while
+## previewing it on a QR code, then upload it to the GitHub repo behind the QR AR website.
+## Everything set here is saved in models.json and used by the website exactly the same way.
 
 const GitHubClient = preload("res://github.gd")
 
@@ -10,6 +11,15 @@ const DEFAULT_OWNER := "Novaillusion"
 const DEFAULT_REPO := "Danangtui_QR_3D_scanner"
 const DEFAULT_SITE := "https://novaillusion.github.io/Danangtui_QR_3D_scanner/"
 const MAX_UPLOAD_MB := 50.0
+const MODEL_EXTS := ["glb", "fbx"]
+const IMAGE_EXTS := ["png", "jpg", "jpeg", "webp"]
+const ALL_MATS := "*"
+
+## Same defaults as the website (index.html → DEFAULT_LIGHTING).
+const DEFAULT_LIGHTING := {
+	"ambient": 1.6, "ambientColor": "#ffffff", "sun": 2.2, "sunColor": "#ffffff",
+	"sunAzimuth": 26.6, "sunElevation": 53.3, "exposure": 1.0, "shadow": 0.55,
+}
 
 var gh: GitHubClient
 var settings := ConfigFile.new()
@@ -17,26 +27,39 @@ var site_url := DEFAULT_SITE
 
 var models := {}            # key -> entry (Dictionary) from models.json
 var selected_key := ""      # key being edited; "" = new model
-var picked_path := ""       # local file chosen for upload
-var key_touched := false    # user typed the key by hand
+var picked_path := ""       # local model file chosen for upload
+var key_touched := false
 var busy := false
+
+# material state
+var mat_overrides := {}     # material name (or "*") -> { color, metalness, ... , map }
+var mat_refs := {}          # material name -> Array of preview materials (duplicates we can edit)
+var mat_orig := {}          # material name -> original values
+var tex_cache := {}         # "local:<path>" or repo path -> Texture2D
+var light_dirty := false    # lighting differs from the defaults
 
 # --- UI ---
 var model_list: ItemList
+var form_title: Label
 var file_label: Label
 var name_edit: LineEdit
 var key_edit: LineEdit
-var scale_spin: SpinBox
-var rot_spin: SpinBox
-var lift_spin: SpinBox
 var anim_edit: LineEdit
+var pos_spins: Array = []
+var rot_spins: Array = []
+var scale_spins: Array = []
+var scale_lock: CheckBox
+var light_ui := {}          # lighting field -> SpinBox or ColorPickerButton
+var mat_select: OptionButton
+var mat_ui := {}            # material field -> SpinBox or ColorPickerButton
+var mat_tex_label: Label
+var tabs: TabContainer
 var upload_btn: Button
 var qr_btn: Button
 var delete_btn: Button
-var browse_btn: Button
 var status_label: Label
-var form_title: Label
 var file_dialog: FileDialog
+var tex_dialog: FileDialog
 var settings_dialog: ConfirmationDialog
 var confirm_delete: ConfirmationDialog
 var s_owner: LineEdit
@@ -47,10 +70,13 @@ var s_site: LineEdit
 
 # --- 3D preview ---
 var viewport: SubViewport
+var env: Environment
+var sun: DirectionalLight3D
+var shadow_mat: StandardMaterial3D
 var pivot: Node3D
 var cam: Camera3D
-var wrap: Node3D            # applies size / rotation / lift, same as the website
-var model_root: Node3D      # fitted model (0.9 of the QR width, standing on it)
+var wrap: Node3D            # user transform (same as the website's wrap group)
+var model_root: Node3D      # fitted model: 0.9 of the QR width, standing on the code
 var anim_player: AnimationPlayer
 var dragging := false
 var yaw := 0.6
@@ -60,13 +86,14 @@ var dist := 2.6
 
 func _ready() -> void:
 	get_window().title = "QR 3D Uploader"
+	get_window().files_dropped.connect(_on_files_dropped)
 	gh = GitHubClient.new()
 	add_child(gh)
 	_build_ui()
 	_load_settings()
 	_new_model()
 	if gh.token == "":
-		_set_status("Welcome! Open Settings and paste your GitHub token to get started.")
+		_set_status("Welcome! Open Settings and paste your GitHub token. You can already load and preview models from this PC.")
 		_open_settings()
 	else:
 		_refresh()
@@ -85,15 +112,15 @@ func _build_ui() -> void:
 	var margin := MarginContainer.new()
 	margin.set_anchors_preset(Control.PRESET_FULL_RECT)
 	for side in ["left", "right", "top", "bottom"]:
-		margin.add_theme_constant_override("margin_" + side, 14)
+		margin.add_theme_constant_override("margin_" + side, 12)
 	add_child(margin)
 
 	var split := HSplitContainer.new()
 	margin.add_child(split)
 
-	# ---- left: list of models on the website ----
+	# ---- left: models on the website ----
 	var left := VBoxContainer.new()
-	left.custom_minimum_size.x = 300
+	left.custom_minimum_size.x = 250
 	split.add_child(left)
 	left.add_child(_title("Models on the website"))
 	model_list = ItemList.new()
@@ -102,50 +129,94 @@ func _build_ui() -> void:
 	left.add_child(model_list)
 	var lrow := HBoxContainer.new()
 	left.add_child(lrow)
-	lrow.add_child(_button("+ New model", _new_model))
+	lrow.add_child(_button("+ New", _new_model))
 	lrow.add_child(_button("Refresh", _refresh))
 	lrow.add_child(_button("Settings", _open_settings))
-	var site_btn := _button("Open website", func(): OS.shell_open(site_url))
-	left.add_child(site_btn)
+	left.add_child(_button("Open website", func(): OS.shell_open(site_url)))
 
-	# ---- right: preview + form ----
-	var right := VBoxContainer.new()
-	right.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	right.add_theme_constant_override("separation", 8)
-	split.add_child(right)
+	var split2 := HSplitContainer.new()
+	split2.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	split.add_child(split2)
 
+	# ---- center: 3D preview ----
+	var center := VBoxContainer.new()
+	center.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	split2.add_child(center)
 	form_title = _title("New model")
-	right.add_child(form_title)
-
+	center.add_child(form_title)
 	var svc := SubViewportContainer.new()
 	svc.stretch = true
 	svc.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	svc.custom_minimum_size = Vector2(420, 320)
+	svc.custom_minimum_size = Vector2(380, 300)
 	svc.gui_input.connect(_on_preview_input)
-	right.add_child(svc)
+	center.add_child(svc)
 	viewport = SubViewport.new()
 	viewport.own_world_3d = true
 	viewport.msaa_3d = Viewport.MSAA_4X
 	svc.add_child(viewport)
 	_build_preview_scene()
-
 	var hint := Label.new()
-	hint.text = "Drag to rotate · scroll to zoom · the square is the QR code (1 unit wide)"
+	hint.text = "Drag to orbit · scroll to zoom · the square is the QR code (1 unit wide) · drop .glb/.fbx or images onto this window"
 	hint.modulate = Color(1, 1, 1, 0.55)
-	right.add_child(hint)
+	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	center.add_child(hint)
 
+	# ---- right: inspector ----
+	var right := VBoxContainer.new()
+	right.custom_minimum_size.x = 390
+	right.add_theme_constant_override("separation", 8)
+	split2.add_child(right)
+	tabs = TabContainer.new()
+	tabs.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	right.add_child(tabs)
+	_build_model_tab()
+	_build_transform_tab()
+	_build_lighting_tab()
+	_build_material_tab()
+
+	var brow := HBoxContainer.new()
+	brow.add_theme_constant_override("separation", 6)
+	right.add_child(brow)
+	upload_btn = _button("Upload to website", _on_upload)
+	upload_btn.custom_minimum_size = Vector2(170, 38)
+	brow.add_child(upload_btn)
+	qr_btn = _button("Show QR", _on_show_qr)
+	brow.add_child(qr_btn)
+	delete_btn = _button("Delete", func(): confirm_delete.popup_centered())
+	brow.add_child(delete_btn)
+	status_label = Label.new()
+	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	status_label.custom_minimum_size = Vector2(380, 60)
+	right.add_child(status_label)
+
+	_build_dialogs()
+
+
+func _tab(title: String) -> GridContainer:
+	var scroll := ScrollContainer.new()
+	scroll.name = title
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	tabs.add_child(scroll)
+	var box := VBoxContainer.new()
+	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(box)
 	var grid := GridContainer.new()
 	grid.columns = 2
-	grid.add_theme_constant_override("h_separation", 12)
-	right.add_child(grid)
+	grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grid.add_theme_constant_override("h_separation", 10)
+	grid.add_theme_constant_override("v_separation", 6)
+	box.add_child(grid)
+	return grid
 
+
+func _build_model_tab() -> void:
+	var grid := _tab("Model")
 	var file_row := HBoxContainer.new()
 	file_label = Label.new()
 	file_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	file_label.clip_text = true
 	file_row.add_child(file_label)
-	browse_btn = _button("Choose file…", func(): file_dialog.popup_centered_ratio(0.7))
-	file_row.add_child(browse_btn)
+	file_row.add_child(_button("Choose file…", func(): file_dialog.popup_centered_ratio(0.7)))
 	_row(grid, "Model file", file_row)
 
 	name_edit = LineEdit.new()
@@ -154,39 +225,101 @@ func _build_ui() -> void:
 	_row(grid, "Name", name_edit)
 
 	key_edit = LineEdit.new()
-	key_edit.placeholder_text = "e.g. dragon (letters a–z, numbers, - and _)"
+	key_edit.placeholder_text = "e.g. dragon (a–z, 0–9, - and _)"
 	key_edit.text_changed.connect(func(_t): key_touched = true)
 	_row(grid, "QR key", key_edit)
 
-	scale_spin = _spin(0.05, 10.0, 0.05, 1.0)
-	_row(grid, "Size", scale_spin)
-	rot_spin = _spin(-180.0, 180.0, 5.0, 0.0)
-	_row(grid, "Rotation (°)", rot_spin)
-	lift_spin = _spin(-1.0, 3.0, 0.05, 0.0)
-	_row(grid, "Lift", lift_spin)
-
 	anim_edit = LineEdit.new()
-	anim_edit.placeholder_text = "optional – animation name or number (empty = first)"
+	anim_edit.placeholder_text = "empty = first animation, or a name/number"
 	anim_edit.text_changed.connect(func(_t): _play_animation())
 	_row(grid, "Animation", anim_edit)
 
-	var brow := HBoxContainer.new()
-	brow.add_theme_constant_override("separation", 8)
-	right.add_child(brow)
-	upload_btn = _button("Upload to website", _on_upload)
-	upload_btn.custom_minimum_size = Vector2(190, 38)
-	brow.add_child(upload_btn)
-	qr_btn = _button("Show QR code", _on_show_qr)
-	brow.add_child(qr_btn)
-	delete_btn = _button("Delete", func(): confirm_delete.popup_centered())
-	brow.add_child(delete_btn)
+	var note := Label.new()
+	note.text = "Formats: .glb (best) or .fbx. For .fbx, embed textures when exporting."
+	note.modulate = Color(1, 1, 1, 0.6)
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	grid.add_child(Control.new())
+	grid.add_child(note)
 
-	status_label = Label.new()
-	status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	status_label.custom_minimum_size.y = 44
-	right.add_child(status_label)
 
-	# ---- dialogs ----
+func _build_transform_tab() -> void:
+	var grid := _tab("Transform")
+	for i in 3:
+		pos_spins.append(_num(grid, "Position " + "XYZ"[i], -5.0, 5.0, 0.01, 0.0, _on_transform_changed))
+	for i in 3:
+		rot_spins.append(_num(grid, "Rotation " + "XYZ"[i] + " (°)", -180.0, 180.0, 1.0, 0.0, _on_transform_changed))
+	scale_lock = CheckBox.new()
+	scale_lock.text = "Uniform scale"
+	scale_lock.button_pressed = true
+	_row(grid, "", scale_lock)
+	for i in 3:
+		var axis := i
+		scale_spins.append(_num(grid, "Scale " + "XYZ"[i], 0.01, 20.0, 0.01, 1.0,
+			func(v): _on_scale_changed(axis, v)))
+	grid.add_child(Control.new())
+	grid.add_child(_button("Reset transform", _reset_transform))
+	var note := Label.new()
+	note.text = "Units are QR-code widths. Y is up from the code; Z points to the code's bottom edge."
+	note.modulate = Color(1, 1, 1, 0.6)
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	grid.add_child(Control.new())
+	grid.add_child(note)
+
+
+func _build_lighting_tab() -> void:
+	var grid := _tab("Lighting")
+	light_ui["ambient"] = _num(grid, "Ambient light", 0.0, 6.0, 0.05, 1.6, _on_lighting_changed)
+	light_ui["ambientColor"] = _color(grid, "Ambient color", Color.WHITE, _on_lighting_changed)
+	light_ui["sun"] = _num(grid, "Sun light", 0.0, 10.0, 0.05, 2.2, _on_lighting_changed)
+	light_ui["sunColor"] = _color(grid, "Sun color", Color.WHITE, _on_lighting_changed)
+	light_ui["sunAzimuth"] = _num(grid, "Sun direction (°)", -180.0, 180.0, 1.0, 26.6, _on_lighting_changed)
+	light_ui["sunElevation"] = _num(grid, "Sun height (°)", 0.0, 90.0, 1.0, 53.3, _on_lighting_changed)
+	light_ui["exposure"] = _num(grid, "Exposure", 0.1, 4.0, 0.05, 1.0, _on_lighting_changed)
+	light_ui["shadow"] = _num(grid, "Ground shadow", 0.0, 1.0, 0.05, 0.55, _on_lighting_changed)
+	grid.add_child(Control.new())
+	grid.add_child(_button("Reset lighting", _reset_lighting))
+	var note := Label.new()
+	note.text = "Lighting is saved per model. The sun turns with the QR code, so the model stays lit the same way as people walk around it."
+	note.modulate = Color(1, 1, 1, 0.6)
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	grid.add_child(Control.new())
+	grid.add_child(note)
+
+
+func _build_material_tab() -> void:
+	var grid := _tab("Material")
+	mat_select = OptionButton.new()
+	mat_select.item_selected.connect(func(_i): _show_material_ui())
+	_row(grid, "Material", mat_select)
+	mat_ui["color"] = _color(grid, "Base color", Color.WHITE, func(c): _on_material_changed("color", c))
+	mat_ui["metalness"] = _num(grid, "Metalness", 0.0, 1.0, 0.01, 0.0, func(v): _on_material_changed("metalness", v))
+	mat_ui["roughness"] = _num(grid, "Roughness", 0.0, 1.0, 0.01, 1.0, func(v): _on_material_changed("roughness", v))
+	mat_ui["emissive"] = _color(grid, "Glow color", Color.BLACK, func(c): _on_material_changed("emissive", c))
+	mat_ui["emissiveIntensity"] = _num(grid, "Glow strength", 0.0, 20.0, 0.1, 1.0, func(v): _on_material_changed("emissiveIntensity", v))
+	mat_ui["opacity"] = _num(grid, "Opacity", 0.0, 1.0, 0.01, 1.0, func(v): _on_material_changed("opacity", v))
+
+	var tex_row := VBoxContainer.new()
+	mat_tex_label = Label.new()
+	mat_tex_label.clip_text = true
+	tex_row.add_child(mat_tex_label)
+	var tb := HBoxContainer.new()
+	tb.add_child(_button("Replace…", func(): tex_dialog.popup_centered_ratio(0.7)))
+	tb.add_child(_button("Remove", func(): _set_texture_override("")))
+	tb.add_child(_button("Original", func(): _clear_material_field("map")))
+	tex_row.add_child(tb)
+	_row(grid, "Texture", tex_row)
+
+	grid.add_child(Control.new())
+	grid.add_child(_button("Reset this material", _reset_material))
+	var note := Label.new()
+	note.text = "'All materials' changes every part of the model; pick one material to change only that part. Only the settings you change are saved."
+	note.modulate = Color(1, 1, 1, 0.6)
+	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	grid.add_child(Control.new())
+	grid.add_child(note)
+
+
+func _build_dialogs() -> void:
 	file_dialog = FileDialog.new()
 	file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
@@ -195,6 +328,15 @@ func _build_ui() -> void:
 	file_dialog.title = "Choose a 3D model"
 	file_dialog.file_selected.connect(_on_file_picked)
 	add_child(file_dialog)
+
+	tex_dialog = FileDialog.new()
+	tex_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	tex_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	tex_dialog.filters = PackedStringArray(["*.png, *.jpg, *.jpeg, *.webp ; Images"])
+	tex_dialog.use_native_dialog = true
+	tex_dialog.title = "Choose a texture image"
+	tex_dialog.file_selected.connect(_on_texture_picked)
+	add_child(tex_dialog)
 
 	confirm_delete = ConfirmationDialog.new()
 	confirm_delete.title = "Delete model"
@@ -230,56 +372,98 @@ func _build_ui() -> void:
 		+ "Repository access: only this repository. Permissions: Contents → Read and write. " \
 		+ "The token is saved only on this PC."
 	sbox.add_child(help)
-	var token_link := _button("Open GitHub token page", func(): OS.shell_open("https://github.com/settings/personal-access-tokens/new"))
-	sbox.add_child(token_link)
+	sbox.add_child(_button("Open GitHub token page",
+		func(): OS.shell_open("https://github.com/settings/personal-access-tokens/new")))
 	settings_dialog.add_child(sbox)
 	settings_dialog.confirmed.connect(_on_settings_saved)
 	add_child(settings_dialog)
 
 
-func _title(text: String) -> Label:
+# ---- small UI helpers ----
+
+func _title(t: String) -> Label:
 	var l := Label.new()
-	l.text = text
+	l.text = t
 	l.add_theme_font_size_override("font_size", 20)
 	return l
 
 
-func _button(text: String, cb: Callable) -> Button:
+func _button(t: String, cb: Callable) -> Button:
 	var b := Button.new()
-	b.text = text
+	b.text = t
 	b.pressed.connect(cb)
 	return b
 
 
-func _spin(lo: float, hi: float, step: float, value: float) -> SpinBox:
-	var s := SpinBox.new()
-	s.min_value = lo
-	s.max_value = hi
-	s.step = step
-	s.value = value
-	s.custom_minimum_size.x = 140
-	s.value_changed.connect(func(_v): _apply_wrap_transform())
-	return s
-
-
-func _row(grid: GridContainer, label: String, control: Control) -> void:
+func _row(grid: GridContainer, label_text: String, control: Control) -> void:
 	var l := Label.new()
-	l.text = label
+	l.text = label_text
 	grid.add_child(l)
 	control.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	grid.add_child(control)
 
 
-func _set_status(text: String, is_error: bool = false) -> void:
-	status_label.text = text
+## Slider + number box. Returns the SpinBox; cb(value) is called only when the user changes it.
+func _num(grid: GridContainer, label_text: String, lo: float, hi: float, step: float, value: float, cb: Callable) -> SpinBox:
+	var row := HBoxContainer.new()
+	var slider := HSlider.new()
+	slider.min_value = lo
+	slider.max_value = hi
+	slider.step = step
+	slider.value = value
+	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var spin := SpinBox.new()
+	spin.min_value = lo
+	spin.max_value = hi
+	spin.step = step
+	spin.value = value
+	spin.allow_greater = true
+	spin.allow_lesser = true
+	spin.custom_minimum_size.x = 96
+	spin.set_meta("slider", slider)
+	slider.value_changed.connect(func(v): spin.value = v)
+	spin.value_changed.connect(func(v):
+		slider.set_value_no_signal(v)
+		cb.call(v)
+	)
+	row.add_child(slider)
+	row.add_child(spin)
+	_row(grid, label_text, row)
+	return spin
+
+
+func _set_num(spin: SpinBox, v: float) -> void:
+	spin.set_value_no_signal(v)
+	(spin.get_meta("slider") as HSlider).set_value_no_signal(v)
+
+
+func _color(grid: GridContainer, label_text: String, value: Color, cb: Callable) -> ColorPickerButton:
+	var b := ColorPickerButton.new()
+	b.color = value
+	b.edit_alpha = false
+	b.custom_minimum_size = Vector2(80, 28)
+	b.color_changed.connect(func(c): cb.call(c))
+	_row(grid, label_text, b)
+	return b
+
+
+func _hex(c: Color) -> String:
+	return "#" + c.to_html(false)
+
+
+func _set_status(t: String, is_error: bool = false) -> void:
+	status_label.text = t
 	status_label.modulate = Color("ff8a80") if is_error else Color("cfe3ff")
 
 
 func _set_busy(on: bool) -> void:
 	busy = on
-	for b in [upload_btn, qr_btn, delete_btn, browse_btn]:
-		b.disabled = on
-	if not on:
+	upload_btn.disabled = on
+	if on:
+		qr_btn.disabled = true
+		delete_btn.disabled = true
+	else:
 		_update_buttons()
 
 
@@ -293,7 +477,7 @@ func _update_buttons() -> void:
 # =====================================================================
 
 func _load_settings() -> void:
-	settings.load(SETTINGS_PATH)  # missing file is fine: defaults below
+	settings.load(SETTINGS_PATH)
 	gh.repo_owner = settings.get_value("github", "owner", DEFAULT_OWNER)
 	gh.repo = settings.get_value("github", "repo", DEFAULT_REPO)
 	gh.branch = settings.get_value("github", "branch", "main")
@@ -338,11 +522,11 @@ func _with_slash(url: String) -> String:
 
 
 # =====================================================================
-# Model list (models.json in the repo)
+# Model list / form
 # =====================================================================
 
 func _refresh() -> void:
-	if busy:
+	if busy or gh.token == "":
 		return
 	_set_busy(true)
 	_set_status("Loading model list…")
@@ -374,16 +558,13 @@ func _new_model() -> void:
 	key_touched = false
 	model_list.deselect_all()
 	form_title.text = "New model"
-	file_label.text = "No file chosen"
+	file_label.text = "No file chosen – click Choose file… or drop a .glb/.fbx here"
 	name_edit.text = ""
 	key_edit.text = ""
-	scale_spin.set_value_no_signal(1.0)
-	rot_spin.set_value_no_signal(0.0)
-	lift_spin.set_value_no_signal(0.0)
 	anim_edit.text = ""
 	upload_btn.text = "Upload to website"
+	_load_entry_to_ui({})
 	_clear_preview()
-	_apply_wrap_transform()
 	_update_buttons()
 
 
@@ -397,21 +578,42 @@ func _on_list_selected(index: int) -> void:
 	file_label.text = str(entry.get("file", ""))
 	name_edit.text = str(entry.get("name", ""))
 	key_edit.text = key
-	scale_spin.set_value_no_signal(float(entry.get("scale", 1.0)))
-	rot_spin.set_value_no_signal(float(entry.get("rotationY", 0.0)))
-	lift_spin.set_value_no_signal(float(entry.get("offsetY", 0.0)))
-	anim_edit.text = str(entry.get("animation", "")) if entry.has("animation") else ""
-	if anim_edit.text.ends_with(".0"):
-		anim_edit.text = anim_edit.text.trim_suffix(".0")
+	anim_edit.text = str(entry.get("animation", "")).trim_suffix(".0") if entry.has("animation") else ""
 	upload_btn.text = "Save changes"
+	_load_entry_to_ui(entry)
 	_update_buttons()
-	_apply_wrap_transform()
 	_preview_remote(entry)
 
 
-func _on_name_changed(text: String) -> void:
+## Put an entry's transform / lighting / material settings into the inspector.
+func _load_entry_to_ui(entry: Dictionary) -> void:
+	# transform (older entries used rotationY / offsetY)
+	var pos: Array = entry.get("position", [0.0, entry.get("offsetY", 0.0), 0.0])
+	var rot: Array = entry.get("rotation", [0.0, entry.get("rotationY", 0.0), 0.0])
+	var sc = entry.get("scale", 1.0)
+	var sca: Array = sc if sc is Array else [sc, sc, sc]
+	for i in 3:
+		_set_num(pos_spins[i], float(pos[i]))
+		_set_num(rot_spins[i], float(rot[i]))
+		_set_num(scale_spins[i], float(sca[i]))
+	scale_lock.set_pressed_no_signal(not (sc is Array) or (sca[0] == sca[1] and sca[1] == sca[2]))
+	_apply_transform()
+
+	# lighting
+	var lighting: Dictionary = entry.get("lighting", {})
+	light_dirty = not lighting.is_empty()
+	var L := DEFAULT_LIGHTING.duplicate()
+	L.merge(lighting, true)
+	_put_lighting_ui(L)
+
+	# materials
+	mat_overrides = (entry.get("materials", {}) as Dictionary).duplicate(true)
+	_rebuild_material_list()
+
+
+func _on_name_changed(t: String) -> void:
 	if not key_touched:
-		key_edit.text = _slug(text)
+		key_edit.text = _slug(t)
 
 
 ## "Rồng Vàng" -> "rong-vang"
@@ -440,20 +642,332 @@ func _valid_key(key: String) -> bool:
 
 
 # =====================================================================
-# Upload / save / delete
+# Loading local files (dialog or drag & drop)
 # =====================================================================
 
+func _on_files_dropped(files: PackedStringArray) -> void:
+	for f in files:
+		var ext := f.get_extension().to_lower()
+		if ext in MODEL_EXTS:
+			_on_file_picked(f)
+		elif ext in IMAGE_EXTS:
+			tabs.current_tab = 3
+			_on_texture_picked(f)
+		else:
+			_set_status("Can't use '%s' – drop a .glb/.fbx model or a .png/.jpg texture." % f.get_file(), true)
+
+
 func _on_file_picked(path: String) -> void:
+	if not FileAccess.file_exists(path):
+		_set_status("File not found: " + path, true)
+		return
 	picked_path = path
 	file_label.text = path
 	if name_edit.text.strip_edges() == "":
 		name_edit.text = path.get_file().get_basename().capitalize()
 		_on_name_changed(name_edit.text)
 	var mb := FileAccess.get_file_as_bytes(path).size() / 1048576.0
-	_set_status("Chosen: %s (%.1f MB). Adjust size/rotation, then upload." % [path.get_file(), mb],
-		mb > MAX_UPLOAD_MB)
-	_preview_local(path)
+	_set_status("Loaded %s (%.1f MB) from this PC. Adjust it, then upload." % [path.get_file(), mb], mb > MAX_UPLOAD_MB)
+	# a new model has different materials: keep only the "all materials" settings
+	var keep: Dictionary = mat_overrides.get(ALL_MATS, {})
+	mat_overrides = {}
+	if not keep.is_empty():
+		mat_overrides[ALL_MATS] = keep
+	_show_model_bytes(FileAccess.get_file_as_bytes(path), path.get_extension().to_lower(), path.get_base_dir())
 
+
+func _on_texture_picked(path: String) -> void:
+	var img := Image.load_from_file(path)
+	if img == null or img.is_empty():
+		_set_status("Couldn't read the image " + path.get_file(), true)
+		return
+	img.generate_mipmaps()
+	tex_cache["local:" + path] = ImageTexture.create_from_image(img)
+	_set_texture_override("local:" + path)
+
+
+# =====================================================================
+# Transform
+# =====================================================================
+
+func _on_transform_changed(_v: float) -> void:
+	_apply_transform()
+
+
+func _on_scale_changed(axis: int, v: float) -> void:
+	if scale_lock.button_pressed:
+		for i in 3:
+			if i != axis:
+				_set_num(scale_spins[i], v)
+	_apply_transform()
+
+
+func _reset_transform() -> void:
+	for i in 3:
+		_set_num(pos_spins[i], 0.0)
+		_set_num(rot_spins[i], 0.0)
+		_set_num(scale_spins[i], 1.0)
+	scale_lock.set_pressed_no_signal(true)
+	_apply_transform()
+
+
+## Same as the website: wrap.position, wrap.rotation (XYZ order, degrees), wrap.scale.
+func _apply_transform() -> void:
+	var r := Vector3(deg_to_rad(rot_spins[0].value), deg_to_rad(rot_spins[1].value), deg_to_rad(rot_spins[2].value))
+	var basis := Basis(Vector3.RIGHT, r.x) * Basis(Vector3.UP, r.y) * Basis(Vector3.BACK, r.z)
+	basis = basis * Basis.from_scale(Vector3(scale_spins[0].value, scale_spins[1].value, scale_spins[2].value))
+	wrap.transform = Transform3D(basis, Vector3(pos_spins[0].value, pos_spins[1].value, pos_spins[2].value))
+
+
+# =====================================================================
+# Lighting
+# =====================================================================
+
+func _put_lighting_ui(L: Dictionary) -> void:
+	for k in light_ui:
+		var c = light_ui[k]
+		if c is ColorPickerButton:
+			c.color = Color(str(L[k]))
+		else:
+			_set_num(c, float(L[k]))
+	_apply_lighting()
+
+
+func _lighting_values() -> Dictionary:
+	var L := {}
+	for k in light_ui:
+		var c = light_ui[k]
+		L[k] = _hex(c.color) if c is ColorPickerButton else snappedf(c.value, 0.001)
+	return L
+
+
+func _on_lighting_changed(_v) -> void:
+	light_dirty = true
+	_apply_lighting()
+
+
+func _reset_lighting() -> void:
+	light_dirty = false
+	_put_lighting_ui(DEFAULT_LIGHTING)
+
+
+func _apply_lighting() -> void:
+	var L := _lighting_values()
+	# The website uses a hemisphere light + a sun; these factors give a similar look in Godot.
+	env.ambient_light_color = Color(str(L["ambientColor"]))
+	env.ambient_light_energy = float(L["ambient"]) * 0.55
+	sun.light_color = Color(str(L["sunColor"]))
+	sun.light_energy = float(L["sun"]) * 0.64
+	var az := deg_to_rad(float(L["sunAzimuth"]))
+	var el := deg_to_rad(float(L["sunElevation"]))
+	var dir := Vector3(sin(az) * cos(el), sin(el), cos(az) * cos(el))
+	var up := Vector3.UP if absf(dir.y) < 0.99 else Vector3.FORWARD
+	sun.basis = Basis.looking_at(-dir, up)
+	env.tonemap_exposure = float(L["exposure"])
+	shadow_mat.albedo_color = Color(0, 0, 0, float(L["shadow"]))
+
+
+# =====================================================================
+# Materials
+# =====================================================================
+
+func _rebuild_material_list() -> void:
+	var prev := _current_mat()
+	mat_select.clear()
+	mat_select.add_item("All materials")
+	mat_select.set_item_metadata(0, ALL_MATS)
+	var names := mat_refs.keys()
+	names.sort()
+	for nm in names:
+		if nm == "":
+			continue  # unnamed materials can only be changed through "All materials"
+		mat_select.add_item(nm)
+		mat_select.set_item_metadata(mat_select.item_count - 1, nm)
+	for i in mat_select.item_count:
+		if mat_select.get_item_metadata(i) == prev:
+			mat_select.select(i)
+	_apply_materials()
+	_show_material_ui()
+
+
+func _current_mat() -> String:
+	if mat_select == null or mat_select.item_count == 0 or mat_select.selected < 0:
+		return ALL_MATS
+	return str(mat_select.get_item_metadata(mat_select.selected))
+
+
+## Effective values (original + overrides) of the selected material, shown in the inspector.
+func _show_material_ui() -> void:
+	var nm := _current_mat()
+	var orig: Dictionary = {}
+	if mat_orig.has(nm):
+		orig = mat_orig[nm]
+	elif not mat_orig.is_empty():
+		orig = mat_orig[mat_orig.keys()[0]]
+	var base := {
+		"color": _hex(orig.get("color", Color.WHITE)),
+		"metalness": orig.get("metallic", 0.0),
+		"roughness": orig.get("roughness", 1.0),
+		"emissive": _hex(orig.get("emission", Color.BLACK)) if orig.get("emission_enabled", false) else "#000000",
+		"emissiveIntensity": orig.get("emission_energy", 1.0),
+		"opacity": (orig.get("color", Color.WHITE) as Color).a,
+	}
+	var ov := _merged_overrides(nm)
+	for k in mat_ui:
+		var v = ov.get(k, base[k])
+		var c = mat_ui[k]
+		if c is ColorPickerButton:
+			c.color = Color(str(v))
+		else:
+			_set_num(c, float(v))
+	var m := str(ov.get("map", "(original)"))
+	if m == "":
+		m = "(removed)"
+	mat_tex_label.text = m.trim_prefix("local:").get_file() if m.begins_with("local:") else m
+
+
+func _merged_overrides(nm: String) -> Dictionary:
+	var ov := {}
+	ov.merge(mat_overrides.get(ALL_MATS, {}), true)
+	if nm != ALL_MATS:
+		ov.merge(mat_overrides.get(nm, {}), true)
+	return ov
+
+
+func _on_material_changed(field: String, value) -> void:
+	var nm := _current_mat()
+	if not mat_overrides.has(nm):
+		mat_overrides[nm] = {}
+	mat_overrides[nm][field] = _hex(value) if value is Color else snappedf(value, 0.001)
+	_apply_materials()
+
+
+func _set_texture_override(map_value: String) -> void:
+	var nm := _current_mat()
+	if not mat_overrides.has(nm):
+		mat_overrides[nm] = {}
+	mat_overrides[nm]["map"] = map_value
+	_apply_materials()
+	_show_material_ui()
+	if map_value.begins_with("local:"):
+		_set_status("Texture loaded from this PC for '%s'. It's uploaded together with the model." % _mat_label(nm))
+
+
+func _clear_material_field(field: String) -> void:
+	var nm := _current_mat()
+	if mat_overrides.has(nm):
+		mat_overrides[nm].erase(field)
+		if mat_overrides[nm].is_empty():
+			mat_overrides.erase(nm)
+	_apply_materials()
+	_show_material_ui()
+
+
+func _reset_material() -> void:
+	mat_overrides.erase(_current_mat())
+	_apply_materials()
+	_show_material_ui()
+
+
+func _mat_label(nm: String) -> String:
+	return "all materials" if nm == ALL_MATS else nm
+
+
+## Collect the model's materials, replacing each with an editable copy.
+func _collect_materials(root: Node) -> void:
+	mat_refs = {}
+	mat_orig = {}
+	var copies := {}   # original material -> copy (shared materials stay shared)
+	for n in root.find_children("*", "MeshInstance3D", true, false):
+		var mi := n as MeshInstance3D
+		if mi.mesh == null:
+			continue
+		for s in mi.mesh.get_surface_count():
+			var m := mi.get_active_material(s)
+			if not (m is BaseMaterial3D):
+				continue
+			if not copies.has(m):
+				copies[m] = m.duplicate()
+			var copy: BaseMaterial3D = copies[m]
+			mi.set_surface_override_material(s, copy)
+			var nm := str(m.resource_name)
+			if not mat_refs.has(nm):
+				mat_refs[nm] = []
+				mat_orig[nm] = {
+					"color": copy.albedo_color, "texture": copy.albedo_texture,
+					"metallic": copy.metallic, "roughness": copy.roughness,
+					"emission_enabled": copy.emission_enabled, "emission": copy.emission,
+					"emission_energy": copy.emission_energy_multiplier, "transparency": copy.transparency,
+				}
+			if not mat_refs[nm].has(copy):
+				mat_refs[nm].append(copy)
+
+
+## Apply "all materials" + per-material overrides to the preview (same rules as the website).
+func _apply_materials() -> void:
+	for nm in mat_refs:
+		var orig: Dictionary = mat_orig[nm]
+		var ov := {}
+		ov.merge(mat_overrides.get(ALL_MATS, {}), true)
+		ov.merge(mat_overrides.get(nm, {}), true)
+		for m in mat_refs[nm]:
+			var mat := m as BaseMaterial3D
+			var col: Color = orig["color"]
+			if ov.has("color"):
+				var c := Color(str(ov["color"]))
+				col = Color(c.r, c.g, c.b, col.a)
+			if ov.has("opacity"):
+				col.a = float(ov["opacity"])
+			mat.albedo_color = col
+			mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA if col.a < 0.999 else orig["transparency"]
+			mat.metallic = float(ov.get("metalness", orig["metallic"]))
+			mat.roughness = float(ov.get("roughness", orig["roughness"]))
+			if ov.has("emissive") or ov.has("emissiveIntensity"):
+				mat.emission_enabled = true
+				mat.emission = Color(str(ov["emissive"])) if ov.has("emissive") else orig["emission"]
+			else:
+				mat.emission_enabled = orig["emission_enabled"]
+				mat.emission = orig["emission"]
+			mat.emission_energy_multiplier = float(ov.get("emissiveIntensity", orig["emission_energy"]))
+			if ov.has("map"):
+				var mp := str(ov["map"])
+				mat.albedo_texture = tex_cache.get(mp, orig["texture"]) if mp != "" else null
+			else:
+				mat.albedo_texture = orig["texture"]
+
+
+## Download textures referenced by an entry so the preview shows them.
+func _fetch_remote_textures() -> void:
+	for nm in mat_overrides.keys():
+		var mp := str(mat_overrides[nm].get("map", ""))
+		if mp == "" or mp.begins_with("local:") or tex_cache.has(mp):
+			continue
+		var r: Dictionary
+		if mp.begins_with("http"):
+			r = await gh.download(mp)
+		else:
+			r = await gh.get_raw(mp)
+		if not r["ok"]:
+			continue
+		var img := Image.new()
+		var bytes: PackedByteArray = r["bytes"]
+		var ext := mp.get_extension().to_lower()
+		var err := ERR_FILE_UNRECOGNIZED
+		if ext == "png":
+			err = img.load_png_from_buffer(bytes)
+		elif ext == "jpg" or ext == "jpeg":
+			err = img.load_jpg_from_buffer(bytes)
+		elif ext == "webp":
+			err = img.load_webp_from_buffer(bytes)
+		if err == OK:
+			img.generate_mipmaps()
+			tex_cache[mp] = ImageTexture.create_from_image(img)
+	_apply_materials()
+
+
+# =====================================================================
+# Upload / save / delete
+# =====================================================================
 
 func _on_upload() -> void:
 	if busy:
@@ -476,10 +990,10 @@ func _on_upload() -> void:
 		return
 
 	_set_busy(true)
-	var entry: Dictionary = (models.get(selected_key, {}) as Dictionary).duplicate()
+	var entry: Dictionary = (models.get(selected_key, {}) as Dictionary).duplicate(true)
 	entry["name"] = display_name
 
-	# 1) upload the model file (only when a new file was chosen)
+	# 1) model file (only when a new one was chosen)
 	if picked_path != "":
 		var bytes := FileAccess.get_file_as_bytes(picked_path)
 		if bytes.is_empty():
@@ -491,18 +1005,52 @@ func _on_upload() -> void:
 			return
 		var repo_path := "models/%s.%s" % [key, picked_path.get_extension().to_lower()]
 		_set_status("Uploading %s (%.1f MB)… this can take a minute for big files." % [picked_path.get_file(), mb])
-		var existing: Dictionary = await gh.get_file(repo_path)
-		var sha: String = existing["sha"] if existing["ok"] else ""
-		var up: Dictionary = await gh.put_file(repo_path, bytes, "Upload model '%s'" % key, sha)
-		if not up["ok"]:
-			_fail("Upload failed: " + up["error"])
+		var ok: bool = await _upload_file(repo_path, bytes, "Upload model '%s'" % key)
+		if not ok:
 			return
 		entry["file"] = repo_path
 
-	# 2) settings shown on the website
-	entry["scale"] = snappedf(scale_spin.value, 0.001)
-	entry["rotationY"] = snappedf(rot_spin.value, 0.1)
-	entry["offsetY"] = snappedf(lift_spin.value, 0.001)
+	# 2) textures loaded from this PC
+	for nm in mat_overrides.keys():
+		var mp := str(mat_overrides[nm].get("map", ""))
+		if not mp.begins_with("local:"):
+			continue
+		var local := mp.trim_prefix("local:")
+		var tbytes := FileAccess.get_file_as_bytes(local)
+		if tbytes.is_empty():
+			_fail("Could not read the texture " + local)
+			return
+		var part := "all" if nm == ALL_MATS else _slug(str(nm))
+		if part == "":
+			part = "mat"
+		var tpath := "models/%s-%s.%s" % [key, part, local.get_extension().to_lower()]
+		_set_status("Uploading texture %s…" % local.get_file())
+		var tok: bool = await _upload_file(tpath, tbytes, "Upload texture for '%s'" % key)
+		if not tok:
+			return
+		tex_cache[tpath] = tex_cache.get(mp)
+		mat_overrides[nm]["map"] = tpath
+
+	# 3) settings used by the website
+	var uniform: bool = scale_lock.button_pressed
+	entry["scale"] = snappedf(scale_spins[0].value, 0.001) if uniform else \
+		[snappedf(scale_spins[0].value, 0.001), snappedf(scale_spins[1].value, 0.001), snappedf(scale_spins[2].value, 0.001)]
+	entry["position"] = [snappedf(pos_spins[0].value, 0.001), snappedf(pos_spins[1].value, 0.001), snappedf(pos_spins[2].value, 0.001)]
+	entry["rotation"] = [snappedf(rot_spins[0].value, 0.1), snappedf(rot_spins[1].value, 0.1), snappedf(rot_spins[2].value, 0.1)]
+	entry.erase("rotationY")
+	entry.erase("offsetY")
+	if light_dirty:
+		entry["lighting"] = _lighting_values()
+	else:
+		entry.erase("lighting")
+	var mats := {}
+	for nm in mat_overrides:
+		if not (mat_overrides[nm] as Dictionary).is_empty():
+			mats[nm] = mat_overrides[nm]
+	if mats.is_empty():
+		entry.erase("materials")
+	else:
+		entry["materials"] = mats
 	var anim := anim_edit.text.strip_edges()
 	if anim == "":
 		entry.erase("animation")
@@ -511,9 +1059,8 @@ func _on_upload() -> void:
 	else:
 		entry["animation"] = anim
 
-	# 3) add / update the entry in models.json (retry once if someone else changed it meanwhile)
+	# 4) models.json (retry once if it changed meanwhile)
 	_set_status("Linking '%s' to its QR code…" % key)
-	var saved := false
 	for attempt in 2:
 		var mj: Dictionary = await gh.get_file("models.json")
 		if not mj["ok"]:
@@ -528,18 +1075,14 @@ func _on_upload() -> void:
 		if selected_key != "" and selected_key != key:
 			cfg["models"].erase(selected_key)
 		cfg["models"][key] = entry
-		var text := JSON.stringify(cfg, "  ", false) + "\n"
-		var put: Dictionary = await gh.put_file("models.json", text.to_utf8_buffer(),
+		var json_text := JSON.stringify(cfg, "  ", false) + "\n"
+		var put: Dictionary = await gh.put_file("models.json", json_text.to_utf8_buffer(),
 			"Add/update model '%s'" % key, mj["sha"])
 		if put["ok"]:
-			saved = true
 			break
 		if put["code"] != 409 or attempt == 1:
 			_fail("Could not update models.json: " + put["error"])
 			return
-	if not saved:
-		_fail("Could not update models.json.")
-		return
 
 	selected_key = key
 	picked_path = ""
@@ -548,7 +1091,19 @@ func _on_upload() -> void:
 	file_label.text = str(entry.get("file", ""))
 	_set_busy(false)
 	await _refresh()
-	_set_status("Done! '%s' is uploaded. The website updates in about 1 minute. Click 'Show QR code' to print its code." % display_name)
+	_show_material_ui()
+	_set_status("Done! '%s' is saved. The website updates in about 1 minute. Click 'Show QR' to print its code." % display_name)
+
+
+## Create or overwrite a file in the repo. Shows the error and returns false on failure.
+func _upload_file(repo_path: String, bytes: PackedByteArray, message: String) -> bool:
+	var existing: Dictionary = await gh.get_file(repo_path)
+	var sha: String = existing["sha"] if existing["ok"] else ""
+	var up: Dictionary = await gh.put_file(repo_path, bytes, message, sha)
+	if not up["ok"]:
+		_fail("Upload of %s failed: %s" % [repo_path.get_file(), up["error"]])
+		return false
+	return true
 
 
 func _on_delete() -> void:
@@ -565,22 +1120,24 @@ func _on_delete() -> void:
 	if not (cfg is Dictionary) or not cfg.has("models"):
 		_fail("models.json in the repo is not valid JSON.")
 		return
-	var file := str(cfg["models"].get(key, {}).get("file", ""))
+	var old_entry: Dictionary = cfg["models"].get(key, {})
 	cfg["models"].erase(key)
 	var put: Dictionary = await gh.put_file("models.json", (JSON.stringify(cfg, "  ", false) + "\n").to_utf8_buffer(),
 		"Remove model '%s'" % key, mj["sha"])
 	if not put["ok"]:
 		_fail("Could not update models.json: " + put["error"])
 		return
-	# delete the model file too, if it lives in the repo and no other model uses it
-	var still_used := false
-	for k in cfg["models"]:
-		if str(cfg["models"][k].get("file", "")) == file:
-			still_used = true
-	if file.begins_with("models/") and not still_used:
-		var f: Dictionary = await gh.get_file(file)
-		if f["ok"] and f["sha"] != "":
-			await gh.delete_file(file, "Delete model file for '%s'" % key, f["sha"])
+	# delete the model file and its textures if they live in the repo and nothing else uses them
+	var files := [str(old_entry.get("file", ""))]
+	var mats: Dictionary = old_entry.get("materials", {})
+	for nm in mats:
+		files.append(str(mats[nm].get("map", "")))
+	var used := JSON.stringify(cfg)
+	for f in files:
+		if f.begins_with("models/") and not used.contains("\"" + f + "\""):
+			var info: Dictionary = await gh.get_file(f)
+			if info["ok"] and info["sha"] != "":
+				await gh.delete_file(f, "Delete file of model '%s'" % key, info["sha"])
 	_set_busy(false)
 	_new_model()
 	await _refresh()
@@ -603,22 +1160,18 @@ func _fail(msg: String) -> void:
 
 func _build_preview_scene() -> void:
 	var env_node := WorldEnvironment.new()
-	var env := Environment.new()
+	env = Environment.new()
 	env.background_mode = Environment.BG_COLOR
 	env.background_color = Color("2a3042")
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.8, 0.83, 0.9)
-	env.ambient_light_energy = 0.9
+	env.tonemap_mode = Environment.TONE_MAPPER_ACES
 	env_node.environment = env
 	viewport.add_child(env_node)
 
-	var sun := DirectionalLight3D.new()
-	sun.rotation_degrees = Vector3(-55, 35, 0)
-	sun.light_energy = 1.4
-	sun.shadow_enabled = true
+	sun = DirectionalLight3D.new()
 	viewport.add_child(sun)
 
-	# white quiet zone + the QR code itself (1 x 1 unit, like on the website)
+	# white paper + QR code (1 x 1 unit, like on the website)
 	var paper := MeshInstance3D.new()
 	var paper_mesh := PlaneMesh.new()
 	paper_mesh.size = Vector2(1.4, 1.4)
@@ -638,6 +1191,28 @@ func _build_preview_scene() -> void:
 	qr_mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
 	qr.material_override = qr_mat
 	viewport.add_child(qr)
+
+	# soft ground shadow, like the website's
+	var blob := MeshInstance3D.new()
+	var blob_mesh := PlaneMesh.new()
+	blob_mesh.size = Vector2(1.3, 1.3)
+	blob.mesh = blob_mesh
+	var grad := Gradient.new()
+	grad.set_color(0, Color(1, 1, 1, 1))
+	grad.set_color(1, Color(1, 1, 1, 0))
+	var gtex := GradientTexture2D.new()
+	gtex.gradient = grad
+	gtex.fill = GradientTexture2D.FILL_RADIAL
+	gtex.fill_from = Vector2(0.5, 0.5)
+	gtex.fill_to = Vector2(1.0, 0.5)
+	shadow_mat = StandardMaterial3D.new()
+	shadow_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	shadow_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	shadow_mat.albedo_texture = gtex
+	shadow_mat.albedo_color = Color(0, 0, 0, 0.55)
+	blob.material_override = shadow_mat
+	blob.position.y = 0.003
+	viewport.add_child(blob)
 
 	wrap = Node3D.new()
 	viewport.add_child(wrap)
@@ -678,22 +1253,16 @@ func _on_preview_input(ev: InputEvent) -> void:
 		if mb.button_index == MOUSE_BUTTON_LEFT:
 			dragging = mb.pressed
 		elif mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_UP:
-			dist = maxf(0.8, dist * 0.9)
+			dist = maxf(0.6, dist * 0.9)
 			_update_camera()
 		elif mb.pressed and mb.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			dist = minf(12.0, dist * 1.1)
+			dist = minf(15.0, dist * 1.1)
 			_update_camera()
 	elif ev is InputEventMouseMotion and dragging:
 		var mm := ev as InputEventMouseMotion
 		yaw -= mm.relative.x * 0.01
-		pitch = clampf(pitch - mm.relative.y * 0.01, -1.45, 0.25)
+		pitch = clampf(pitch - mm.relative.y * 0.01, -1.5, 0.3)
 		_update_camera()
-
-
-func _apply_wrap_transform() -> void:
-	wrap.scale = Vector3.ONE * float(scale_spin.value)
-	wrap.rotation = Vector3(0, deg_to_rad(rot_spin.value), 0)
-	wrap.position = Vector3(0, lift_spin.value, 0)
 
 
 func _clear_preview() -> void:
@@ -701,11 +1270,9 @@ func _clear_preview() -> void:
 		c.queue_free()
 	model_root = null
 	anim_player = null
-
-
-func _preview_local(path: String) -> void:
-	var ext := path.get_extension().to_lower()
-	_show_model_bytes(FileAccess.get_file_as_bytes(path), ext, path.get_base_dir())
+	mat_refs = {}
+	mat_orig = {}
+	_rebuild_material_list()
 
 
 func _preview_remote(entry: Dictionary) -> void:
@@ -722,25 +1289,33 @@ func _preview_remote(entry: Dictionary) -> void:
 		r = await gh.download(file)
 	else:
 		r = await gh.get_raw(file)
-	if selected_key != key_at_start:
+	if selected_key != key_at_start or picked_path != "":
 		return  # user selected something else meanwhile
 	if not r["ok"]:
 		_set_status("Could not download the model for preview: " + r["error"], true)
 		return
 	_show_model_bytes(r["bytes"], ext, "")
-	_set_status("Editing '%s'. Change settings and click 'Save changes', or choose a new file to replace the model." % selected_key)
+	await _fetch_remote_textures()
+	_set_status("Editing '%s'. Change anything and click 'Save changes', or choose a new file to replace the model." % selected_key)
 
 
 func _show_model_bytes(bytes: PackedByteArray, ext: String, base_path: String) -> void:
-	_clear_preview()
+	for c in wrap.get_children():
+		c.queue_free()
+	model_root = null
+	anim_player = null
+	mat_refs = {}
+	mat_orig = {}
 	if bytes.is_empty():
 		_set_status("The model file is empty.", true)
+		_rebuild_material_list()
 		return
 	var doc: GLTFDocument
 	var state: GLTFState
 	if ext == "fbx":
 		if not ClassDB.class_exists("FBXDocument"):
 			_set_status("This Godot build can't preview .fbx files – uploading still works.")
+			_rebuild_material_list()
 			return
 		doc = ClassDB.instantiate("FBXDocument")
 		state = ClassDB.instantiate("FBXState")
@@ -750,15 +1325,19 @@ func _show_model_bytes(bytes: PackedByteArray, ext: String, base_path: String) -
 	var err := doc.append_from_buffer(bytes, base_path, state)
 	if err != OK:
 		_set_status("Couldn't read this model for the preview (error %d). It may still work on the website." % err, true)
+		_rebuild_material_list()
 		return
 	var scene := doc.generate_scene(state)
 	if scene == null:
 		_set_status("Couldn't build the preview for this model.", true)
+		_rebuild_material_list()
 		return
 	model_root = Node3D.new()
 	wrap.add_child(model_root)
 	model_root.add_child(scene)
 	_fit_model()
+	_collect_materials(scene)
+	_rebuild_material_list()
 	var players := scene.find_children("*", "AnimationPlayer", true, false)
 	if players.size() > 0:
 		anim_player = players[0]
@@ -790,15 +1369,15 @@ func _fit_model() -> void:
 func _play_animation() -> void:
 	if anim_player == null:
 		return
-	var names := anim_player.get_animation_list()
-	if names.is_empty():
+	var anim_names := anim_player.get_animation_list()
+	if anim_names.is_empty():
 		return
 	var want := anim_edit.text.strip_edges()
-	var pick: String = names[0]
-	if want.is_valid_int() and want.to_int() >= 0 and want.to_int() < names.size():
-		pick = names[want.to_int()]
+	var pick: String = anim_names[0]
+	if want.is_valid_int() and want.to_int() >= 0 and want.to_int() < anim_names.size():
+		pick = anim_names[want.to_int()]
 	elif want != "":
-		for nm in names:
+		for nm in anim_names:
 			if nm == want or nm.ends_with("/" + want):
 				pick = nm
 				break
