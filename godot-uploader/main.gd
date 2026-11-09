@@ -18,7 +18,7 @@ const ALL_MATS := "*"
 ## Same defaults as the website (index.html → DEFAULT_LIGHTING).
 const DEFAULT_LIGHTING := {
 	"ambient": 1.6, "ambientColor": "#ffffff", "sun": 2.2, "sunColor": "#ffffff",
-	"sunAzimuth": 26.6, "sunElevation": 53.3, "exposure": 1.0, "shadow": 0.55,
+	"sunAzimuth": 26.6, "sunElevation": 53.3, "exposure": 1.0, "shadow": 0.55, "environment": 0.6,
 }
 
 var gh: GitHubClient
@@ -73,6 +73,7 @@ var viewport: SubViewport
 var env: Environment
 var sun: DirectionalLight3D
 var shadow_mat: StandardMaterial3D
+var sky_mat: ProceduralSkyMaterial
 var pivot: Node3D
 var cam: Camera3D
 var wrap: Node3D            # user transform (same as the website's wrap group)
@@ -296,6 +297,7 @@ func _build_lighting_tab() -> void:
 	light_ui["sunAzimuth"] = _num(grid, "Sun direction (°)", -180.0, 180.0, 1.0, 26.6, _on_lighting_changed)
 	light_ui["sunElevation"] = _num(grid, "Sun height (°)", 0.0, 90.0, 1.0, 53.3, _on_lighting_changed)
 	light_ui["exposure"] = _num(grid, "Exposure", 0.1, 4.0, 0.05, 1.0, _on_lighting_changed)
+	light_ui["environment"] = _num(grid, "Reflections", 0.0, 3.0, 0.05, 0.6, _on_lighting_changed)
 	light_ui["shadow"] = _num(grid, "Ground shadow", 0.0, 1.0, 0.05, 0.55, _on_lighting_changed)
 	grid.add_child(Control.new())
 	grid.add_child(_button("Reset lighting", _reset_lighting))
@@ -824,9 +826,13 @@ func _apply_lighting() -> void:
 	var L := _lighting_values()
 	# The website uses a hemisphere light + a sun; these factors give a similar look in Godot.
 	env.ambient_light_color = Color(str(L["ambientColor"]))
-	env.ambient_light_energy = float(L["ambient"]) * 0.55
+	# three.js divides light by π for diffuse surfaces; Godot doesn't, hence the 1/PI factors.
+	# The studio environment adds roughly 0.8 of extra all-round light per unit of "Reflections".
+	var env_amount := float(L.get("environment", 0.6))
+	env.ambient_light_energy = float(L["ambient"]) / PI + env_amount * 0.8
+	sky_mat.energy_multiplier = env_amount
 	sun.light_color = Color(str(L["sunColor"]))
-	sun.light_energy = float(L["sun"]) * 0.64
+	sun.light_energy = float(L["sun"]) / PI
 	var az := deg_to_rad(float(L["sunAzimuth"]))
 	var el := deg_to_rad(float(L["sunElevation"]))
 	var dir := Vector3(sin(az) * cos(el), sin(el), cos(az) * cos(el))
@@ -1304,7 +1310,17 @@ func _build_preview_scene() -> void:
 	env.background_mode = Environment.BG_COLOR
 	env.background_color = Color("2a3042")
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.tonemap_mode = Environment.TONE_MAPPER_ACES
+	env.tonemap_mode = Environment.TONE_MAPPER_AGX   # same as the website
+	# neutral "studio" sky used only for reflections, like the website's RoomEnvironment
+	sky_mat = ProceduralSkyMaterial.new()
+	sky_mat.sky_top_color = Color(0.92, 0.92, 0.92)
+	sky_mat.sky_horizon_color = Color(0.78, 0.78, 0.8)
+	sky_mat.ground_horizon_color = Color(0.6, 0.6, 0.62)
+	sky_mat.ground_bottom_color = Color(0.35, 0.35, 0.36)
+	var sky := Sky.new()
+	sky.sky_material = sky_mat
+	env.sky = sky
+	env.reflected_light_source = Environment.REFLECTION_SOURCE_SKY
 	env_node.environment = env
 	viewport.add_child(env_node)
 

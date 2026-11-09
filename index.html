@@ -98,6 +98,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { QRTracker, toGray, buildPyramid } from './tracker.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
@@ -113,12 +114,15 @@ const LOST_AFTER_MS = 400;    // keep the model briefly when tracking drops for 
 const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, alpha: true, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMapping = THREE.AgXToneMapping;   // same tone mapping as the Godot uploader preview
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, 1, 0.01, 1000); // stays at origin looking down -Z
 
-const hemi = new THREE.HemisphereLight(0xffffff, 0x445566, 1.6);
+// Soft studio surroundings: gives glossy / metallic materials something to reflect
+// (without it they look very dark) and adds gentle all-round light.
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+const hemi = new THREE.HemisphereLight(0xffffff, 0x8a96a6, 1.6);
 scene.add(hemi);
 
 // "anchor" follows the QR code. Local frame: x = right along the code, y = up out of the code,
@@ -171,7 +175,7 @@ let mixer = null;
 let spinTarget = null;   // built-in model spins gently
 
 // ---------- Per-model lighting ----------
-const DEFAULT_LIGHTING = { ambient: 1.6, ambientColor: '#ffffff', sun: 2.2, sunColor: '#ffffff',
+const DEFAULT_LIGHTING = { ambient: 1.6, ambientColor: '#ffffff', sun: 2.2, sunColor: '#ffffff', environment: 0.6,
   sunAzimuth: 26.6, sunElevation: 53.3, exposure: 1.0, shadow: 0.55 };
 function applyLighting(lighting) {
   const L = { ...DEFAULT_LIGHTING, ...(lighting || {}) };
@@ -180,6 +184,7 @@ function applyLighting(lighting) {
   const az = THREE.MathUtils.degToRad(L.sunAzimuth), el = THREE.MathUtils.degToRad(L.sunElevation);
   sun.position.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)).multiplyScalar(5);
   renderer.toneMappingExposure = L.exposure;
+  scene.environmentIntensity = L.environment;
   shadow.material.opacity = L.shadow;
 }
 applyLighting();
