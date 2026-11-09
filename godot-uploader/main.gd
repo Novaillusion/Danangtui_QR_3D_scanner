@@ -1100,7 +1100,7 @@ func _on_upload() -> void:
 
 	# 4) models.json (retry once if it changed meanwhile)
 	_set_status("Linking '%s' to its QR code…" % key)
-	for attempt in 2:
+	for attempt in 4:
 		var mj: Dictionary = await gh.get_file("models.json")
 		if not mj["ok"]:
 			_fail("Could not read models.json: " + mj["error"])
@@ -1119,9 +1119,10 @@ func _on_upload() -> void:
 			"Add/update model '%s'" % key, mj["sha"])
 		if put["ok"]:
 			break
-		if put["code"] != 409 or attempt == 1:
+		if put["code"] != 409 or attempt == 3:
 			_fail("Could not update models.json: " + put["error"])
 			return
+		await get_tree().create_timer(1.5 * (attempt + 1)).timeout
 
 	selected_key = key
 	picked_path = ""
@@ -1135,14 +1136,20 @@ func _on_upload() -> void:
 
 
 ## Create or overwrite a file in the repo. Shows the error and returns false on failure.
+## GitHub answers 409 when the repo changed at the same moment (another save); then we simply retry.
 func _upload_file(repo_path: String, bytes: PackedByteArray, message: String) -> bool:
-	var existing: Dictionary = await gh.get_file(repo_path)
-	var sha: String = existing["sha"] if existing["ok"] else ""
-	var up: Dictionary = await gh.put_file(repo_path, bytes, message, sha)
-	if not up["ok"]:
-		_fail("Upload of %s failed: %s" % [repo_path.get_file(), up["error"]])
-		return false
-	return true
+	var up: Dictionary = {}
+	for attempt in 4:
+		var existing: Dictionary = await gh.get_file(repo_path)
+		var sha: String = existing["sha"] if existing["ok"] else ""
+		up = await gh.put_file(repo_path, bytes, message, sha)
+		if up["ok"]:
+			return true
+		if up["code"] != 409 and up["code"] != 422:
+			break
+		await get_tree().create_timer(1.5 * (attempt + 1)).timeout
+	_fail("Upload of %s failed: %s" % [repo_path.get_file(), up["error"]])
+	return false
 
 
 func _on_delete() -> void:
