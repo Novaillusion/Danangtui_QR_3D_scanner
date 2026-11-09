@@ -226,7 +226,7 @@ func _build_model_tab() -> void:
 
 	key_edit = LineEdit.new()
 	key_edit.placeholder_text = "e.g. dragon (a–z, 0–9, - and _)"
-	key_edit.text_changed.connect(func(_t): key_touched = true)
+	key_edit.text_changed.connect(_on_key_typed)
 	_row(grid, "QR key", key_edit)
 
 	anim_edit = LineEdit.new()
@@ -636,6 +636,44 @@ func _slug(s: String) -> String:
 	return out.trim_suffix("-")
 
 
+## Keep the QR key valid while typing: "Tara Test" -> "tara-test" (lowercase, no spaces, no accents).
+func _on_key_typed(t: String) -> void:
+	key_touched = true
+	var clean := _clean_key(t)
+	if clean != t:
+		var caret := key_edit.caret_column
+		key_edit.text = clean
+		key_edit.caret_column = mini(caret, clean.length())
+
+
+func _clean_key(s: String) -> String:
+	var out := ""
+	for ch in _slug_chars(s.to_lower()):
+		var c: String = ch
+		if (c >= "a" and c <= "z") or (c >= "0" and c <= "9") or c == "-" or c == "_":
+			out += c
+		elif c == " ":
+			out += "-"
+	return out
+
+
+## Replace Vietnamese accented letters with plain ones ("ồ" -> "o", "đ" -> "d").
+func _slug_chars(s: String) -> String:
+	const GROUPS := {
+		"a": "àáạảãâầấậẩẫăằắặẳẵ", "e": "èéẹẻẽêềếệểễ", "i": "ìíịỉĩ", "o": "òóọỏõôồốộổỗơờớợởỡ",
+		"u": "ùúụủũưừứựửữ", "y": "ỳýỵỷỹ", "d": "đ",
+	}
+	var out := ""
+	for ch in s:
+		var c: String = ch
+		for base in GROUPS:
+			if GROUPS[base].contains(c):
+				c = base
+				break
+		out += c
+	return out
+
+
 func _valid_key(key: String) -> bool:
 	var re := RegEx.create_from_string("^[a-z0-9_-]+$")
 	return re.search(key) != null
@@ -972,12 +1010,13 @@ func _fetch_remote_textures() -> void:
 func _on_upload() -> void:
 	if busy:
 		return
-	var key := key_edit.text.strip_edges()
+	var key := _clean_key(key_edit.text.strip_edges())
+	key_edit.text = key
 	var display_name := name_edit.text.strip_edges()
 	if display_name == "":
 		display_name = key
 	if not _valid_key(key):
-		_set_status("The QR key may only contain a–z, 0–9, - and _ (no spaces).", true)
+		_set_status("Please enter a QR key (letters a–z, numbers, - or _).", true)
 		return
 	if selected_key == "" and picked_path == "":
 		_set_status("Choose a model file first.", true)
