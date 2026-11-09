@@ -42,6 +42,16 @@
           "metalness": 0.25,
           "roughness": 0.54
         }
+      },
+      "lighting": {
+        "ambient": 3.0,
+        "ambientColor": "#ffffff",
+        "sun": 2.2,
+        "sunColor": "#ffffff",
+        "sunAzimuth": 27.0,
+        "sunElevation": 53.0,
+        "exposure": 1.0,
+        "shadow": 0.55
       }
     }
   }
