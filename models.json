@@ -44,14 +44,15 @@
         }
       },
       "lighting": {
-        "ambient": 3.0,
+        "ambient": 0.0,
         "ambientColor": "#ffffff",
         "sun": 2.2,
         "sunColor": "#ffffff",
         "sunAzimuth": 27.0,
         "sunElevation": 53.0,
         "exposure": 2.0,
-        "shadow": 0.55
+        "environment": 0.25,
+        "shadow": 1.0
       }
     }
   }
